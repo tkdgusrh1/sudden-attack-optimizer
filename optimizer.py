@@ -68,7 +68,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 # 화면 아래에 표시된다. 무엇이 돌고 있는지 바로 확인할 수 있게 올려둔다.
-__version__ = "2.3.0"
+__version__ = "2.3.1"
 
 log = logging.getLogger("서든어택최적화")
 
@@ -1309,7 +1309,9 @@ class Record:
 
     @property
     def label(self) -> str:
-        return self.when.strftime("%Y년 %m월 %d일 %H:%M")
+        # strftime 에 한글을 넣으면 한국어가 아닌 윈도우(파이썬 3.11 이하)에서 터진다
+        w = self.when
+        return f"{w.year}년 {w.month:02d}월 {w.day:02d}일 {w.hour:02d}:{w.minute:02d}"
 
     @property
     def keys(self) -> list[str]:
