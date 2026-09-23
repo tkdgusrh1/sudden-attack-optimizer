@@ -67,7 +67,7 @@
 
 ### exe 는 어떻게 만들어지나
 
-저장소에 `v` 로 시작하는 태그를 올리면 GitHub 이 **진짜 윈도우 컴퓨터**에서
+`optimizer.py` 가 바뀌어 main 에 올라오면 GitHub 이 **진짜 윈도우 컴퓨터**에서
 검사를 전부 돌리고 → exe 를 만들고 → 그 exe 로 화면까지 실제로 띄워본 뒤 → 통과해야만
 Releases 에 올립니다 (`.github/workflows/build-exe.yml`).
 
