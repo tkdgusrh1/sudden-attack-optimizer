@@ -1,0 +1,60 @@
+name: 실행 파일 (exe)
+
+# 파이썬이 없는 컴퓨터에 나눠줄 exe 를 만든다.
+#  - v 로 시작하는 태그를 올리면: exe 를 만들어 Releases 페이지에 올린다
+#  - Actions 탭에서 손으로 돌리면: exe 를 만들어 이 실행 결과에만 붙인다
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest "pyinstaller>=6,<7"
+      - run: python -m pytest -q
+
+      - name: exe 만들기
+        run: pyinstaller --onefile --console --clean --name SuddenAttack-Optimizer optimizer.py
+
+      # 만든 exe 가 진짜 윈도우에서 도는지 — 버전, 상태 출력(레지스트리·powercfg·점검),
+      # 화면(웹 서버)까지 실제로 띄워본다. 여기서 실패하면 올리지 않는다.
+      - name: 만든 exe 확인
+        shell: pwsh
+        run: |
+          $exe = "dist\SuddenAttack-Optimizer.exe"
+          & $exe --version
+          if ($LASTEXITCODE -ne 0) { throw "version 실패" }
+          & $exe status
+          if ($LASTEXITCODE -ne 0) { throw "status 실패" }
+          $p = Start-Process $exe -ArgumentList "screen","--no-browser","--no-auto","--port","8790" -PassThru
+          $ok = $false
+          foreach ($i in 1..30) {
+            Start-Sleep -Seconds 1
+            try {
+              $r = Invoke-WebRequest "http://127.0.0.1:8790/" -UseBasicParsing
+              if ($r.StatusCode -eq 200 -and $r.Content -match 'name="token"') { $ok = $true; break }
+            } catch { }
+          }
+          Get-Process -Name "SuddenAttack-Optimizer" -ErrorAction SilentlyContinue | Stop-Process -Force
+          if (-not $ok) { throw "화면이 뜨지 않음" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SuddenAttack-Optimizer
+          path: dist/SuddenAttack-Optimizer.exe
+
+      - name: Releases 에 올리기
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/SuddenAttack-Optimizer.exe
+          body_path: .github/release-notes.md

@@ -5,8 +5,11 @@
 이 폴더째 복사해서 다른 컴퓨터에 옮겨도 그대로 돕니다.
 
 쓰는 법
-    서든어택 최적화.bat 을 더블클릭 → 브라우저에 화면이 뜹니다 → 파란 버튼 하나.
-    되돌리려면 되돌리기.bat, 또는 화면의 '원래대로 되돌리기' 버튼.
+    나눠줄 때는 exe 하나 (Releases 페이지, 파이썬 필요 없음) → 더블클릭.
+    처음 실행이면 이 컴퓨터를 읽고 맞는 설정을 알아서 적용한 뒤 결과를 보여준다.
+    두 번째부터는 알아서 바꾸지 않는다 — 화면의 파란 버튼을 직접 누른다.
+    파이썬이 있으면 서든어택 최적화.bat 을 더블클릭해도 똑같다.
+    되돌리려면 화면의 '원래대로 되돌리기' 버튼 (또는 되돌리기.bat).
 
     터미널에서 쓰려면:
         python optimizer.py            화면 띄우기 (기본)
@@ -18,7 +21,7 @@
     [1]  레지스트리     윈도우 설정값을 읽고 쓴다
     [2]  명령 실행      powercfg · PowerShell · 관리자 권한
     [3]  모니터         주사율 확인과 변경
-    [4]  컴퓨터 정보    CPU · 그래픽 · 메모리 · 윈도우
+    [4]  컴퓨터 정보    CPU · 그래픽 · 메모리 · 윈도우 · 점검 · 핑
     [5]  게임 찾기      서든어택이 어디 깔려 있나
     [6]  되돌리기 기록  바꾸기 전 값을 파일로 남긴다
     [7]  최적화 항목    ← 항목을 더하고 빼는 곳
@@ -40,18 +43,23 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import ctypes
+import hmac
 import html
+import io
 import json
 import logging
 import os
 import platform
 import re
+import secrets
 import socket
 import string
 import subprocess
 import sys
 import threading
+import time
 import webbrowser
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -60,14 +68,31 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 # 화면 아래에 표시된다. 무엇이 돌고 있는지 바로 확인할 수 있게 올려둔다.
-__version__ = "2.2.0"
+__version__ = "2.3.0"
 
 log = logging.getLogger("서든어택최적화")
 
 # 윈도우가 아니면 winreg 도 powercfg 도 없다. 화면은 열리되 아무것도 바꾸지 않는다.
 WINDOWS = sys.platform.startswith("win")
 
-ROOT = Path(__file__).resolve().parent
+# exe 하나로 묶여서 도는가 (PyInstaller). 파이썬이 없는 컴퓨터에 나눠줄 때 이렇게 돈다.
+FROZEN = bool(getattr(sys, "frozen", False))
+
+
+def _data_root() -> Path:
+    """되돌리기 기록을 둘 곳.
+
+    exe 는 실행될 때마다 임시 폴더에 풀려서 돈다. 거기 기록을 두면 끄는 순간 사라진다.
+    그래서 exe 는 사용자 폴더(%LOCALAPPDATA%)에 둔다 — exe 를 지웠다가 다시 받아도
+    되돌리기가 된다. 파이썬으로 돌릴 때는 예전처럼 이 폴더 안에 둔다.
+    """
+    if FROZEN:
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home())
+        return Path(base) / "SuddenAttackOptimizer"
+    return Path(__file__).resolve().parent
+
+
+ROOT = _data_root()
 
 
 # ============================================================================
@@ -352,6 +377,21 @@ class FakeShell:
         return self.run(["powershell", "-Command", script], timeout=timeout)
 
 
+# PowerShell 이 작은따옴표로 치는 글자들. 곧은 따옴표뿐 아니라 굽은 따옴표도 똑같이 친다.
+_PS_QUOTES = "'‘’‚‛"
+
+
+def ps_literal(text) -> str:
+    """PowerShell 명령 안에 넣을 글자를 '글자 그대로' 로 감싼다.
+
+    큰따옴표("…")로 감싸면 PowerShell 은 그 안의 $( ) 를 명령으로 실행한다. 폴더 이름에는
+    $ 도 괄호도 들어갈 수 있어서, 이름 하나 때문에 엉뚱한 명령이 관리자 권한으로 돌 수
+    있다. 작은따옴표 안에서는 아무것도 실행되지 않는다. 따옴표 자신만 두 번 써서 넣는다.
+    """
+    escaped = "".join(ch * 2 if ch in _PS_QUOTES else ch for ch in str(text))
+    return f"'{escaped}'"
+
+
 def _decode(raw: bytes | None) -> str:
     if not raw:
         return ""
@@ -379,19 +419,25 @@ def is_admin() -> bool:
         return False
 
 
-def relaunch_as_admin(script: str) -> bool:
-    """관리자 권한으로 자기 자신을 다시 띄운다. 띄웠으면 True."""
+def relaunch_as_admin() -> bool:
+    """관리자 권한으로 자기 자신을 다시 띄운다. 띄웠으면 True.
+
+    사용자가 '아니요' 를 누르면 False — 그때는 그냥 일반 권한으로 계속 돈다.
+    다시 뜬 쪽에는 --elevated 를 붙여서, 또 물어보는 일이 없게 한다.
+    """
     if not WINDOWS:
         return False
     try:                    # pragma: no cover - 윈도우 전용
-        import ctypes
-
-        from pathlib import Path
-
-        target = Path(script).resolve()
-        rc = ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", sys.executable, f'"{target}"', str(target.parent), 1
-        )
+        # 받았던 옵션(포트 등)은 그대로 넘긴다
+        extra = subprocess.list2cmdline(["--elevated", *sys.argv[1:]])
+        if FROZEN:
+            program, params = sys.executable, extra
+            folder = str(Path(sys.executable).resolve().parent)
+        else:
+            target = Path(sys.argv[0]).resolve()
+            program, params = sys.executable, f'"{target}" {extra}'
+            folder = str(target.parent)
+        rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", program, params, folder, 1)
         return rc > 32
     except Exception as exc:  # pragma: no cover - 윈도우 전용
         log.warning("관리자 권한으로 다시 띄우지 못했습니다: %s", exc)
@@ -423,6 +469,7 @@ DM_BITSPERPEL = 0x00040000
 DM_PELSWIDTH = 0x00080000
 DM_PELSHEIGHT = 0x00100000
 DM_DISPLAYFREQUENCY = 0x00400000
+DM_INTERLACED = 0x00000002           # dmDisplayFlags — 한 줄 걸러 그리는 옛날 TV 방식
 
 DISPLAY_DEVICE_ATTACHED_TO_DESKTOP = 0x00000001
 
@@ -545,6 +592,8 @@ class WindowsDisplay:
                 and mode.dmBitsPerPel == current.dmBitsPerPel
                 # 1Hz 는 "드라이버가 알아서" 라는 뜻이라 올리면 안 된다
                 and 1 < int(mode.dmDisplayFrequency) < 1000
+                # TV 는 숫자만 높은 '인터레이스' 모드를 같이 내놓는다. 화면이 떨려서 못 쓴다.
+                and not mode.dmDisplayFlags & DM_INTERLACED
             ):
                 best = max(best, int(mode.dmDisplayFrequency))
         return best
@@ -615,6 +664,8 @@ def open_display():
 CPU_KEY = r"HARDWARE\DESCRIPTION\System\CentralProcessor\0"
 GPU_KEY = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
 WINDOWS_KEY = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+# '지난 30초 녹화' 스위치. 이게 켜져 있어야 게임 도중 실제로 녹화가 돈다.
+RECORDING_KEY = r"Software\Microsoft\Windows\CurrentVersion\GameDVR"
 
 
 @dataclass
@@ -626,6 +677,8 @@ class Spec:
     windows: str = ""
     monitors: list = field(default_factory=list)
     laptop: bool = False
+    on_battery: bool = False
+    recording: bool = False      # 배경 녹화가 실제로 돌고 있나
 
     @property
     def gpu(self) -> str:
@@ -637,13 +690,17 @@ class Spec:
 
 
 def read_spec(registry, display=None) -> Spec:
+    power = _power_status()
+    recording = registry.read("HKCU", RECORDING_KEY, "HistoricalCaptureEnabled")
     spec = Spec(
         cpu=_cpu(registry),
         cores=os.cpu_count() or 0,
         ram_gb=_ram_gb(),
         gpus=_gpus(registry),
         windows=_windows(registry),
-        laptop=is_laptop(),
+        laptop=is_laptop(power),
+        on_battery=bool(power and power.BatteryFlag != 128 and power.ACLineStatus == 0),
+        recording=bool(recording and _same(recording.data, 1)),
     )
     if display is not None:
         try:
@@ -733,22 +790,291 @@ class _SYSTEM_POWER_STATUS(ctypes.Structure):
     ]
 
 
-def is_laptop() -> bool:
+def _power_status():
+    if not WINDOWS:
+        return None
+    try:                            # pragma: no cover - 윈도우 전용
+        status = _SYSTEM_POWER_STATUS()
+        if ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(status)):
+            return status
+    except Exception as exc:        # pragma: no cover - 윈도우 전용
+        log.debug("배터리를 확인하지 못했습니다: %s", exc)
+    return None
+
+
+def is_laptop(power=None) -> bool:
     """배터리가 달려 있으면 노트북으로 본다.
 
     같은 항목이라도 노트북과 데스크톱에서 체감이 다르다. 특히 전원 계획이 그렇다.
     노트북은 CPU 가 절전하려고 속도를 크게 낮춰서 차이가 확 나는데, 데스크톱은
     원래 잘 안 낮춘다. "이 컴퓨터에서는 어떤가" 를 말하려면 이걸 알아야 한다.
     """
-    if not WINDOWS:
-        return False
-    try:                            # pragma: no cover - 윈도우 전용
-        status = _SYSTEM_POWER_STATUS()
-        if ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(status)):
-            return status.BatteryFlag != 128     # 128 = 시스템 배터리 없음
-    except Exception as exc:        # pragma: no cover - 윈도우 전용
-        log.debug("배터리를 확인하지 못했습니다: %s", exc)
-    return False
+    power = power or _power_status()
+    return bool(power and power.BatteryFlag != 128)     # 128 = 시스템 배터리 없음
+
+
+# --- 점검 — 버튼으로는 못 고치지만 알아야 하는 것 --------------------------
+#
+# 최적화 항목과 달리 여기는 **읽기만 한다.** 메모리 속도(바이오스), 무선 연결(랜선),
+# 오버레이(각 프로그램 설정) 는 이 프로그램이 대신 바꿀 수 없다. 그렇다고 말을 안 하면
+# 윈도우 설정을 다 맞추고도 럽샷·키 씹힘이 그대로인 이유를 영영 모르게 된다.
+# 이 대화에서 실제로 원인이었던 것들(디스코드 오버레이, 메모리 속도) 부터 넣었다.
+
+WARN = "warn"       # 확인해 보세요
+INFO = "info"       # 참고
+GOOD = "good"       # 괜찮습니다
+CHECK_LABEL = {WARN: "확인", INFO: "참고", GOOD: "정상"}
+
+PING_HOST = "1.1.1.1"       # 서울에도 서버가 있어 어느 통신사든 가깝게 닿는다
+PING_COUNT = 10
+
+# 메모리 종류 — SMBIOS 가 정한 번호
+MEMORY_TYPES = {24: "DDR3", 26: "DDR4", 34: "DDR5"}
+
+# 메모리와 인터넷 연결을 한 번에 읽는다. PowerShell 은 뜨는 데만 1초 가까이 걸려서 한 번만 부른다.
+HARDWARE_SCRIPT = (
+    "$ErrorActionPreference='SilentlyContinue';"
+    "$m=@(Get-CimInstance Win32_PhysicalMemory"
+    " | Select-Object Capacity,Speed,ConfiguredClockSpeed,SMBIOSMemoryType);"
+    f"$r=Find-NetRoute -RemoteIPAddress {PING_HOST}"
+    " | Where-Object {$_.InterfaceIndex} | Select-Object -First 1;"
+    "$n=$null;"
+    "if($r){$n=Get-NetAdapter -InterfaceIndex $r.InterfaceIndex"
+    " | Select-Object Name,InterfaceDescription,PhysicalMediaType,LinkSpeed};"
+    "[pscustomobject]@{memory=$m;network=$n} | ConvertTo-Json -Compress -Depth 3"
+)
+
+# 게임 화면 위에 끼어드는 프로그램들. 실행 파일 이름 → 화면에 쓸 이름
+OVERLAYS = {
+    "discord.exe": "Discord",
+    "nvidia overlay.exe": "NVIDIA 오버레이",
+    "rtss.exe": "RivaTuner(애프터버너)",
+    "obs64.exe": "OBS",
+    "obs32.exe": "OBS",
+}
+
+
+@dataclass
+class Check:
+    title: str
+    level: str
+    line: str
+
+    @property
+    def label(self) -> str:
+        return CHECK_LABEL.get(self.level, self.level)
+
+
+def read_hardware(shell) -> dict:
+    """메모리 모듈과 지금 인터넷이 나가는 랜카드. 못 읽으면 빈 dict."""
+    result = shell.powershell(HARDWARE_SCRIPT, timeout=30)
+    if not result.ok:
+        return {}
+    for line in reversed((result.out or "").splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                data = json.loads(line)
+            except ValueError:
+                return {}
+            return data if isinstance(data, dict) else {}
+    return {}
+
+
+def running_programs(shell) -> set:
+    """지금 켜져 있는 프로그램의 실행 파일 이름 (소문자)."""
+    result = shell.run(["tasklist", "/FO", "CSV", "/NH"], timeout=15)
+    if not result.ok:
+        return set()
+    return {row[0].strip().lower() for row in csv.reader(io.StringIO(result.out or "")) if row}
+
+
+def memory_check(memory, laptop: bool = False) -> Check | None:
+    """메모리가 제 속도로, 두 줄(듀얼 채널)로 돌고 있나.
+
+    바이오스에서 EXPO/XMP 를 안 켜면 DDR5 는 4800 으로 돈다. 윈도우는 그걸 알려주지
+    않는다. 다만 원래 4800 짜리 제품도 있어서 '틀렸다' 가 아니라 '확인해 보라' 로 말한다.
+    노트북은 대개 메모리를 바꿀 수 없어서 판정하지 않는다.
+    """
+    modules = memory if isinstance(memory, list) else [memory]
+    modules = [m for m in modules if isinstance(m, dict)]
+    if not modules:
+        return None
+
+    kind = MEMORY_TYPES.get(_number(modules[0].get("SMBIOSMemoryType")), "")
+    rated = max(_number(m.get("Speed")) for m in modules)
+    running = min((speed for speed in (_number(m.get("ConfiguredClockSpeed")) for m in modules)
+                   if speed), default=0)
+    if running and rated and running * 2 == rated:
+        running = rated          # 옛날 윈도우는 절반(MHz)으로 적는다
+    running = running or rated
+    total = sum(_number(m.get("Capacity")) for m in modules) / 1024 ** 3
+
+    label = " ".join(part for part in (
+        kind, f"{running}MT/s" if running else "", f"{len(modules)}개",
+        f"(총 {total:g}GB)" if total else "",
+    ) if part)
+    if laptop:
+        return Check("메모리", GOOD, f"{label} — 노트북이라 따로 판정하지 않습니다.")
+
+    problems = []
+    if len(modules) == 1:
+        problems.append("한 개만 꽂혀 있어 한 줄(싱글 채널)로 돕니다. 같은 제품을 하나 더 "
+                        "꽂으면 메모리가 데이터를 두 배로 나릅니다.")
+    if kind == "DDR5" and running and running <= 4800:
+        problems.append("DDR5 의 기본 속도로 돌고 있습니다. 바이오스에서 EXPO(AMD) 나 "
+                        "XMP(인텔) 를 켜면 제 속도가 납니다. 원래 4800 짜리 제품이면 이게 "
+                        "정상입니다.")
+    elif kind == "DDR4" and running and running <= 2666:
+        problems.append("DDR4 의 기본 속도로 돌고 있을 수 있습니다. 바이오스에서 XMP(DOCP) "
+                        "를 켜면 제 속도가 납니다. 원래 그 속도 제품이면 정상입니다.")
+    if problems:
+        return Check("메모리", WARN, f"{label} — " + " ".join(problems)
+                     + " 서든어택은 프레임이 남아서 체감이 작지만, 무거운 게임에서는 큽니다.")
+    return Check("메모리", GOOD, f"{label} — 제 속도로 두 줄 이상 돌고 있습니다.")
+
+
+def network_check(adapter) -> Check | None:
+    """인터넷이 랜선으로 나가나, 와이파이로 나가나."""
+    if not isinstance(adapter, dict):
+        return None
+    media = str(adapter.get("PhysicalMediaType") or "")
+    speed = str(adapter.get("LinkSpeed") or "").strip()
+    if "802.11" in media:
+        return Check("인터넷 연결", WARN,
+                     "와이파이(무선)로 연결돼 있습니다. 무선은 핑이 순간순간 튀고 신호가 새기 "
+                     "쉬워서 럽샷·순간이동의 가장 흔한 원인입니다. 랜선을 꽂는 게 이 화면의 "
+                     "어떤 설정보다 큽니다.")
+    if "802.3" in media:
+        slow = re.match(r"(\d+(?:\.\d+)?)\s*Mbps", speed, re.I)
+        if slow and float(slow.group(1)) <= 100:
+            return Check("인터넷 연결", INFO,
+                         f"유선(랜선)인데 {speed} 로 잡혀 있습니다. 보통은 1 Gbps 가 나옵니다. "
+                         "랜선이 낡았거나 덜 꽂혔을 수 있습니다. 다운로드가 느려질 뿐 핑에는 "
+                         "거의 영향이 없습니다.")
+        return Check("인터넷 연결", GOOD, f"유선(랜선){' · ' + speed if speed else ''} — 좋습니다.")
+    return None
+
+
+def overlay_check(programs) -> Check | None:
+    """게임 위에 끼어드는 프로그램이 켜져 있나.
+
+    이 프로그램을 만들면서 실제로 겪은 일이다 — 키가 가끔 씹히던 원인이 디스코드
+    오버레이였다. 켜져 있다고 다 문제는 아니라서 '참고' 로만 말한다.
+    """
+    found = []
+    for exe, name in OVERLAYS.items():
+        if exe in programs and name not in found:
+            found.append(name)
+    if not found:
+        return None
+    how = []
+    if "Discord" in found:
+        how.append("Discord 는 사용자 설정 → 게임 오버레이 → 끄기")
+    if "NVIDIA 오버레이" in found:
+        how.append("NVIDIA 는 NVIDIA 앱 → 설정 → 기능 → NVIDIA 오버레이 (녹화·성능 표시를 "
+                   "안 쓰면 끄기)")
+    tail = f" {' · '.join(how)}." if how else ""
+    return Check("켜져 있는 오버레이", INFO,
+                 f"{', '.join(found)}. 오버레이는 게임 화면 위에 끼어드는 프로그램이라, 키가 "
+                 f"가끔 씹히거나 순간 끊김이 있으면 가장 먼저 꺼볼 곳입니다.{tail}")
+
+
+def battery_check(spec) -> Check | None:
+    if spec.laptop and spec.on_battery:
+        return Check("전원", WARN,
+                     "지금 배터리로 돌고 있습니다. 배터리로는 CPU 와 그래픽카드가 속도를 크게 "
+                     "낮춥니다. 게임할 때는 충전기를 꽂으세요 — 노트북에서는 이게 제일 큽니다.")
+    return None
+
+
+def system_checks(ctx, spec) -> list[Check]:
+    """점검 전부. 윈도우가 아니면 읽을 게 없다."""
+    if not ctx.windows:
+        return []
+    found = [battery_check(spec)]
+    try:
+        hardware = read_hardware(ctx.shell)
+        found.append(memory_check(hardware.get("memory"), laptop=spec.laptop))
+        found.append(network_check(hardware.get("network")))
+    except Exception as exc:
+        log.debug("메모리·연결을 읽지 못했습니다: %s", exc)
+    try:
+        found.append(overlay_check(running_programs(ctx.shell)))
+    except Exception as exc:
+        log.debug("켜진 프로그램을 읽지 못했습니다: %s", exc)
+    order = {WARN: 0, INFO: 1, GOOD: 2}
+    return sorted((c for c in found if c), key=lambda c: order.get(c.level, 9))
+
+
+# --- 핑 재기 ---------------------------------------------------------------
+@dataclass
+class PingResult:
+    sent: int
+    times: list                 # 응답이 온 것만 (ms)
+    host: str = PING_HOST
+
+    @property
+    def lost(self) -> int:
+        return max(self.sent - len(self.times), 0)
+
+    @property
+    def average(self) -> float:
+        return sum(self.times) / len(self.times) if self.times else 0.0
+
+    @property
+    def spread(self) -> float:
+        return max(self.times) - min(self.times) if self.times else 0.0
+
+
+# 응답 한 줄의 시간. 한국어는 '시간=6ms', 영어는 'time=6ms', 1ms 미만은 '<1ms'.
+_PING_TIME = re.compile(r"[=<]\s*(\d+(?:\.\d+)?)\s*ms", re.I)
+
+
+def parse_ping(text: str, sent: int, host: str = PING_HOST) -> PingResult:
+    """ping 출력에서 응답 시간만 뽑는다.
+
+    요약 줄('최소 = 5ms…')은 언어마다 글자가 달라서 안 읽는다. 대신 응답 줄마다 붙는
+    'TTL=' 을 센다. '대상 호스트에 연결할 수 없습니다' 같은 줄은 TTL 이 없어서 손실로 잡힌다.
+    """
+    times = []
+    for line in (text or "").splitlines():
+        if "ttl=" not in line.lower():
+            continue
+        found = _PING_TIME.search(line)
+        if found:
+            times.append(float(found.group(1)))
+    return PingResult(sent=sent, times=times[:sent], host=host)
+
+
+def measure_ping(shell, host: str = PING_HOST, count: int = PING_COUNT) -> PingResult:
+    result = shell.run(["ping", "-n", str(count), "-w", "1000", host], timeout=count * 2 + 10)
+    return parse_ping(result.out, count, host)
+
+
+def ping_check(result: PingResult) -> Check:
+    if not result.times:
+        return Check("핑", WARN, f"{result.host} 에서 응답이 하나도 없습니다. 인터넷이 끊겼거나 "
+                                "방화벽이 핑을 막고 있습니다.")
+    numbers = (f"평균 {result.average:.0f}ms · 가장 빠름 {min(result.times):.0f}ms / 가장 느림 "
+               f"{max(result.times):.0f}ms · 손실 {result.lost}/{result.sent}")
+    if result.lost:
+        return Check("핑", WARN, f"{numbers} — 신호가 중간에 사라지고 있습니다. 럽샷·순간이동의 "
+                                "직접 원인입니다. 무선이면 랜선으로, 유선이면 공유기를 껐다 켜고 "
+                                "랜선을 바꿔 보세요. 그래도 손실이 나오면 통신사에 회선 점검을 "
+                                "요청하세요.")
+    if result.spread >= 30:
+        return Check("핑", WARN, f"{numbers} — 핑이 흔들립니다. 교전에서는 평균보다 이 흔들림이 "
+                                "더 크게 느껴집니다. 집에서 다른 기기가 영상이나 다운로드를 "
+                                "돌리고 있지 않은지 보세요.")
+    return Check("핑", GOOD, f"{numbers} — 손실 없이 고릅니다. 회선 쪽은 문제없습니다.")
+
+
+def _number(value) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return 0
 
 
 # ============================================================================
@@ -776,6 +1102,10 @@ UNINSTALL_KEYS = [
 # 이름에 이게 들어 있으면 서든어택으로 본다.
 NAME_HINTS = ("suddenattack", "sudden attack", "서든어택", "서든")
 
+# 이름이 서든어택으로 시작해도 게임이 아닌 것들 — 설치·업데이트·제거 프로그램.
+# 다운로드 폴더의 설치 파일을 게임으로 잡으면, 다운로드 폴더 통째로 백신 검사에서 빠진다.
+NOT_THE_GAME = ("setup", "install", "uninst", "updat", "patch", "launcher", "crash", "report")
+
 # 넥슨 게임이 흔히 들어가는 자리. 드라이브는 실제로 있는 것만 훑는다.
 FOLDER_HINTS = [
     r"Nexon",
@@ -799,6 +1129,7 @@ class Install:
 
 def find_game(registry=None, roots=None, saved: str | None = None) -> Install | None:
     """설치 위치를 찾는다. 못 찾으면 None."""
+    saved = clean_path(saved or "")
     if saved:
         found = _from_path(Path(saved), "직접 넣은 경로")
         if found:
@@ -874,9 +1205,57 @@ def _exe_in(folder: Path, source: str) -> Install | None:
         return None
     for exe in entries:
         stem = exe.stem.lower().replace(" ", "").replace("_", "")
-        if stem.startswith("sudden") or stem in ("sa", "sa_main"):
+        if any(word in stem for word in NOT_THE_GAME):
+            continue
+        if stem.startswith("sudden") or stem in ("sa", "samain"):
             return Install(exe=exe, folder=folder, source=source)
     return None
+
+
+def clean_path(value: str) -> str:
+    """사람이 붙여넣은 경로를 다듬는다.
+
+    탐색기의 '경로로 복사' 는 경로 앞뒤에 큰따옴표를 붙여준다. 그대로 두면 그런 폴더가
+    없다고 나온다.
+    """
+    return (value or "").strip().strip('"').strip("'").strip()
+
+
+def too_broad(folder, env=None) -> str:
+    """게임 폴더라고 보기엔 너무 넓은 곳이면 그 이유를, 아니면 "" 를 준다.
+
+    백신 검사 제외는 그 폴더 안의 모든 파일에 걸린다. 드라이브 통째로나 다운로드·바탕화면
+    같은 곳이 빠지면, 거기 떨어지는 악성 파일까지 검사를 안 하게 된다.
+    """
+    env = os.environ if env is None else env
+
+    def norm(path) -> str:
+        return str(path or "").replace("/", "\\").rstrip("\\").lower()
+
+    target = norm(folder)
+    if not target:
+        return ""
+    if re.fullmatch(r"[a-z]:", target):
+        return "드라이브 전체입니다"
+
+    home = norm(env.get("USERPROFILE"))
+    windows = norm(env.get("SystemRoot") or r"C:\Windows")
+    # 이 폴더들이거나, 이 폴더들을 품고 있으면 안 된다 (C:\Users 처럼)
+    wide = [windows, norm(env.get("ProgramFiles") or r"C:\Program Files"),
+            norm(env.get("ProgramFiles(x86)") or r"C:\Program Files (x86)"),
+            norm(env.get("ProgramData") or r"C:\ProgramData"), home]
+    for place in filter(None, wide):
+        if place == target or place.startswith(target + "\\"):
+            return "윈도우나 사용자 전체가 들어 있는 폴더입니다"
+    if target.startswith(windows + "\\"):
+        return "윈도우 폴더 안입니다"
+    # 이 폴더들 자체도 안 된다 (파일이 아무렇게나 떨어지는 곳)
+    loose = [norm(env.get(name)) for name in ("APPDATA", "LOCALAPPDATA", "TEMP", "OneDrive")]
+    if home:
+        loose += [f"{home}\\{name}" for name in ("desktop", "downloads", "documents")]
+    if target in filter(None, loose):
+        return "바탕화면·다운로드처럼 아무 파일이나 떨어지는 폴더입니다"
+    return ""
 
 
 def _from_path(given: Path, source: str) -> Install | None:
@@ -911,8 +1290,10 @@ def _drives() -> list[str]:
 # 바꾸기 전 값을 파일로 남긴다.
 #
 # 이 프로그램에서 제일 중요한 파일이다. 최적화는 언제든 되돌릴 수 있어야 하고,
-# 되돌리기의 근거는 오직 여기 적힌 '원래 값'이다. 그래서 적용은 기록을 먼저 저장한
-# 뒤에 한다 — 중간에 전원이 나가도 되돌릴 근거는 남아 있어야 한다.
+# 되돌리기의 근거는 오직 여기 적힌 '원래 값'이다. 그래서
+#   · 아무것도 바꾸기 전에 기록을 남길 수 있는 폴더인지부터 확인하고
+#   · 항목 하나를 바꿀 때마다 곧바로 파일에 적는다.
+# 기록을 못 남겼으면 방금 바꾼 항목은 그 자리에서 되돌리고 멈춘다 ([8] 실행기).
 
 BACKUP_FOLDER = "backup"
 RECORD_PREFIX = "최적화기록-"
@@ -940,12 +1321,16 @@ def backup_folder(root: Path | None = None) -> Path:
     return base / BACKUP_FOLDER
 
 
-def save_record(entries: dict, root: Path | None = None, when: datetime | None = None) -> Path:
-    """되돌리기 기록을 새 파일로 남기고 그 경로를 준다."""
+def save_record(entries: dict, root: Path | None = None, when: datetime | None = None,
+                path: Path | None = None) -> Path:
+    """되돌리기 기록을 남기고 그 경로를 준다.
+
+    path 를 주면 그 파일을 고쳐 쓴다(한 번 누른 최적화는 파일 하나). 안 주면 새 파일.
+    """
     when = when or datetime.now()
     target = backup_folder(root)
     target.mkdir(parents=True, exist_ok=True)
-    path = target / f"{RECORD_PREFIX}{when:%Y%m%d-%H%M%S}.json"
+    path = path or _new_record_path(target, when)
 
     payload = {
         "when": when.isoformat(timespec="seconds"),
@@ -958,6 +1343,33 @@ def save_record(entries: dict, root: Path | None = None, when: datetime | None =
     os.replace(temporary, path)
     log.info("되돌리기 기록을 남겼습니다: %s", path.name)
     return path
+
+
+def _new_record_path(folder: Path, when: datetime) -> Path:
+    """같은 초에 두 번 눌러도 앞 기록을 덮어쓰지 않는다. 뒤에 _2, _3 을 붙인다.
+
+    '_' 는 '.' 보다 뒤에 정렬되므로 이름순으로 뒤집으면 새 기록이 앞에 온다.
+    """
+    stem = f"{RECORD_PREFIX}{when:%Y%m%d-%H%M%S}"
+    path = folder / f"{stem}.json"
+    number = 2
+    while path.exists():
+        path = folder / f"{stem}_{number}.json"
+        number += 1
+    return path
+
+
+def check_writable(root: Path | None = None) -> None:
+    """기록을 남길 수 있는 폴더인지 본다. 못 남기면 OSError.
+
+    Program Files 처럼 막힌 곳에 프로그램을 풀어두면 설정은 바뀌는데 기록은 못 남기는
+    일이 생긴다. 그러면 되돌릴 근거가 없다. 그래서 바꾸기 전에 먼저 확인한다.
+    """
+    target = backup_folder(root)
+    target.mkdir(parents=True, exist_ok=True)
+    probe = target / ".쓰기확인"
+    probe.write_text("", encoding="utf-8")
+    probe.unlink()
 
 
 def record_history(root: Path | None = None) -> list[Record]:
@@ -1076,6 +1488,10 @@ class RegItem:
 class Action:
     """상태 확인 / 적용 / 되돌리기. 적용은 되돌리기에 필요한 기록을 돌려준다."""
 
+    def skip_reason(self, ctx) -> str:
+        """이 컴퓨터에서는 일부러 안 하는 이유. 비어 있으면 해도 된다."""
+        return ""
+
     def state(self, ctx) -> str:
         raise NotImplementedError
 
@@ -1151,6 +1567,15 @@ class MouseAction(RegistryAction):
     윈도우에 바로 알려서 그 자리에서 적용시킨다.
     """
 
+    def state(self, ctx) -> str:
+        # 가속을 켜고 끄는 건 MouseSpeed 하나다. 제어판에서 '포인터 정확도 향상' 을 풀면
+        # MouseSpeed 만 0 이 되고 나머지 두 값(6, 10)은 그대로 남는다. 그것까지 보면
+        # 이미 꺼둔 사람에게 "가속이 켜져 있습니다" 라고 거짓말을 하게 된다.
+        speed = ctx.registry.read("HKCU", r"Control Panel\Mouse", "MouseSpeed")
+        if speed is None:
+            return OFF
+        return ON if _same(speed.data, "0") else OFF
+
     def after_apply(self, ctx) -> None:
         if not ctx.windows:
             return
@@ -1202,22 +1627,42 @@ class LayersAction(RegistryAction):
 
     전체 화면 최적화는 윈도우가 게임을 몰래 창 모드로 돌리는 기능이다. 알트탭은
     빨라지지만 화면이 한 단계 더 거쳐 나가서 입력이 늦게 느껴진다.
+
+    이 값은 실행 파일 '속성 → 호환성' 탭과 같은 자리다. 거기서 '관리자 권한으로 실행'
+    같은 걸 이미 걸어뒀을 수 있으므로 덮어쓰지 않고 **우리 것만 보탠다.**
+    DPI 설정도 사용자가 따로 골라둔 게 있으면 그걸 존중한다.
     """
+
+    KEY = r"Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers"
+    FSO = "DISABLEDXMAXIMIZEDWINDOWEDMODE"
+    DPI = ("HIGHDPIAWARE", "DPIUNAWARE", "GDIDPISCALING")
 
     def __init__(self):
         super().__init__([])
 
+    def _flags(self, ctx) -> list[str]:
+        current = ctx.registry.read("HKCU", self.KEY, str(ctx.install.exe))
+        if current is None or not isinstance(current.data, str):
+            return []
+        return [flag for flag in current.data.split() if flag != "~"]
+
+    def state(self, ctx) -> str:
+        if not ctx.install:
+            return NA
+        flags = {flag.upper() for flag in self._flags(ctx)}
+        return ON if self.FSO in flags and flags & set(self.DPI) else OFF
+
     def items(self, ctx) -> list[RegItem]:
         if not ctx.install:
             return []
-        return [
-            RegItem(
-                "HKCU",
-                r"Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers",
-                str(ctx.install.exe),
-                RegValue("~ DISABLEDXMAXIMIZEDWINDOWEDMODE HIGHDPIAWARE", STR),
-            )
-        ]
+        flags = self._flags(ctx)
+        upper = {flag.upper() for flag in flags}
+        if self.FSO not in upper:
+            flags.append(self.FSO)
+        if not upper & set(self.DPI):
+            flags.append("HIGHDPIAWARE")
+        return [RegItem("HKCU", self.KEY, str(ctx.install.exe),
+                        RegValue("~ " + " ".join(flags), STR))]
 
 
 class PriorityAction(RegistryAction):
@@ -1251,19 +1696,32 @@ class PowerPlanAction(Action):
     뒤 우리가 만든 것을 지우는 것이라, 사용자가 손수 맞춰둔 설정이 사라질 일이 없다.
     """
 
+    PLUGGED = ("/setacvalueindex",)                        # 전원을 꽂았을 때만
+    ALWAYS = ("/setacvalueindex", "/setdcvalueindex")      # 배터리일 때도
+
     SETTINGS = [
-        # (묶음 GUID, 설정 GUID, 값, 설명)
+        # (묶음 GUID, 설정 GUID, 값, 언제, 설명)
         ("2a737441-1930-4402-8d77-b2bebba308a3", "48e6b7a6-50f5-4782-a5d4-53bb8f07e226", 0,
-         "USB 선택적 절전 해제 (게임 중 마우스가 잠깐 멎는 일 방지)"),
+         ALWAYS, "USB 선택적 절전 해제 (게임 중 마우스가 잠깐 멎는 일 방지)"),
         ("501a4d13-42af-4429-9fd1-a8218c268e20", "ee12f906-d277-404b-b6da-e5fa1a576df5", 0,
-         "PCI Express 링크 절전 끄기 (그래픽카드가 졸지 않게)"),
+         ALWAYS, "PCI Express 링크 절전 끄기 (그래픽카드가 졸지 않게)"),
+        # 배터리일 때까지 100% 로 묶으면 노트북이 금방 뜨거워지고 금방 꺼진다.
         ("54533251-82be-4824-96c1-47b60b740d00", "893dee8e-2bef-41e0-89c6-b55d0929964c", 100,
-         "프로세서 최소 상태 100%"),
+         PLUGGED, "프로세서 최소 상태 100%"),
         ("54533251-82be-4824-96c1-47b60b740d00", "bc5038f7-23e0-4960-96da-33abaf5935ec", 100,
-         "프로세서 최대 상태 100%"),
+         ALWAYS, "프로세서 최대 상태 100%"),
         ("0012ee47-9041-4b5d-9b77-535fba8b1442", "6738e2c4-e8a5-4a42-b16a-e040e769756e", 0,
-         "하드디스크 절전 끄기"),
+         ALWAYS, "하드디스크 절전 끄기"),
     ]
+
+    def skip_reason(self, ctx) -> str:
+        # 코어 묶음이 둘인 라이젠 9 X3D 는 AMD 칩셋 드라이버가 '균형 조정' 계획에서만
+        # 게임을 캐시 큰 쪽 코어로 몰아준다. 고성능 계열 계획은 그걸 끈다.
+        cpu = _cpu(ctx.registry).lower()
+        if "ryzen 9" in cpu and "x3d" in cpu:
+            return ("라이젠 9 X3D 는 윈도우 '균형 조정' 전원 계획에서만 게임이 캐시 큰 코어로 "
+                    "갑니다. 이 CPU 는 전원 계획을 안 바꾸는 쪽이 빠릅니다")
+        return ""
 
     def state(self, ctx) -> str:
         active = self._active(ctx)
@@ -1328,8 +1786,8 @@ class PowerPlanAction(Action):
         return None
 
     def _tune(self, ctx, scheme: str) -> None:
-        for group, setting, value, label in self.SETTINGS:
-            for mode in ("/setacvalueindex", "/setdcvalueindex"):
+        for group, setting, value, modes, label in self.SETTINGS:
+            for mode in modes:
                 result = ctx.shell.run(["powercfg", mode, scheme, group, setting, str(value)])
                 if not result.ok:
                     # 노트북에만 있는 항목, 데스크톱에만 있는 항목이 섞여 있다.
@@ -1366,8 +1824,19 @@ class DefenderExclusionAction(Action):
 
     게임이 읽는 파일마다 백신이 한 번씩 훑으면 렉이 걸린다. 대신 그 폴더는 검사를
     안 하게 되므로, 공식 경로로 설치한 게임 폴더에만 걸어야 한다. 그래서 기본으로
-    켜두지 않았다.
+    켜두지 않았고, 드라이브 통째나 다운로드 폴더 같은 넓은 곳에는 아예 걸지 않는다.
+
+    폴더 이름은 반드시 ps_literal 로 감싼다. 큰따옴표로 감싸면 이름 속 $( ) 가 명령으로
+    실행된다 — 이 명령은 관리자 권한으로 돈다.
     """
+
+    def skip_reason(self, ctx) -> str:
+        if not ctx.install:
+            return ""
+        why = too_broad(ctx.install.folder)
+        if why:
+            return f"게임 폴더라고 보기엔 너무 넓은 곳이라 걸지 않습니다 ({why})"
+        return ""
 
     def state(self, ctx) -> str:
         if not ctx.install:
@@ -1375,7 +1844,8 @@ class DefenderExclusionAction(Action):
         if not ctx.windows:
             return UNKNOWN
         result = ctx.shell.powershell("(Get-MpPreference).ExclusionPath -join [char]10")
-        if not result.ok:
+        # 관리자가 아니면 목록 대신 'N/A: Must be an administrator…' 가 온다
+        if not result.ok or result.out.strip().upper().startswith("N/A"):
             return UNKNOWN
         target = str(ctx.install.folder).lower().rstrip("\\")
         listed = [line.strip().lower().rstrip("\\") for line in result.out.splitlines()]
@@ -1384,15 +1854,20 @@ class DefenderExclusionAction(Action):
     def apply(self, ctx) -> dict:
         if not ctx.install:
             return {"kind": "defender", "paths": []}
+        why = self.skip_reason(ctx)
+        if why:
+            raise RuntimeError(why)
         folder = str(ctx.install.folder)
-        result = ctx.shell.powershell(f'Add-MpPreference -ExclusionPath "{folder}"')
+        result = ctx.shell.powershell(f"Add-MpPreference -ExclusionPath {ps_literal(folder)}")
         if not result.ok:
             raise RuntimeError(f"검사 제외를 넣지 못했습니다: {result.err or result.out}")
         return {"kind": "defender", "paths": [folder]}
 
     def revert(self, ctx, record: dict) -> None:
         for folder in record.get("paths") or []:
-            ctx.shell.powershell(f'Remove-MpPreference -ExclusionPath "{folder}"')
+            result = ctx.shell.powershell(f"Remove-MpPreference -ExclusionPath {ps_literal(folder)}")
+            if not result.ok:
+                raise RuntimeError(f"검사 제외를 빼지 못했습니다: {result.err or result.out}")
 
 
 # ---------------------------------------------------------------------------
@@ -1473,10 +1948,12 @@ def catalog() -> list[Tweak]:
             key="visual_effects",
             title="윈도우 화면 효과 줄이기",
             what="창이 부드럽게 열리고 닫히는 애니메이션, 메뉴가 뜨는 지연을 없앱니다.",
-            gain="게임 프레임은 오르지 않습니다. 대신 알트탭이 눈에 띄게 빨라집니다.",
+            gain="게임과는 관계가 없습니다. 창과 메뉴가 기다림 없이 바로 뜹니다. 대신 창을 "
+                 "끌 때 테두리만 따라오는 식으로 윈도우 모양이 투박해집니다.",
             impact=SMALL,
-            affects="알트탭",
+            affects="바탕화면",
             group="화면",
+            recommended=False,
             action=RegistryAction([
                 RegItem("HKCU", r"Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects",
                         "VisualFXSetting", RegValue(2, DWORD)),
@@ -1510,10 +1987,10 @@ def catalog() -> list[Tweak]:
             title="네트워크 지연 줄이기 (Nagle 끄기)",
             what="작은 신호를 잠깐 모았다가 한꺼번에 보내는 윈도우 기능을 끕니다. "
                  "파일 받을 땐 이득이지만 게임에는 손해입니다.",
-            gain="총 쏜 신호가 모으는 시간 없이 바로 나갑니다. 평균 핑보다 '핑이 갑자기 "
-                 "튀는 것'이 줄어듭니다. 회선 상태에 따라 차이가 크고, 아예 못 느끼는 "
-                 "경우도 있습니다.",
-            impact=MID,
+            gain="게임 신호가 모으는 시간 없이 바로 나갑니다. 다만 이건 TCP 라는 방식으로 "
+                 "오가는 신호에만 걸립니다. 서든어택 교전 신호가 어느 방식인지는 공개된 게 "
+                 "없어서, 체감을 약속하지 않겠습니다. 해서 손해 볼 건 없습니다.",
+            impact=SMALL,
             affects="핑",
             group="네트워크",
             action=NagleAction(),
@@ -1541,11 +2018,13 @@ def catalog() -> list[Tweak]:
             key="mmcss_games",
             title="게임에 CPU·GPU 우선 배정",
             what="윈도우가 갖고 있는 '게임' 작업 등급의 우선순위를 올립니다.",
-            gain="배경에서 도는 프로그램 때문에 생기는 순간 끊김이 줄어듭니다. 크롬 탭이나 "
-                 "디스코드를 많이 켜둘수록 차이가 납니다.",
+            gain="게임이 스스로 이 등급에 이름을 올려야 먹습니다. 요즘 게임 일부만 그렇게 하고, "
+                 "서든어택 같은 오래된 게임은 대개 안 합니다. 그래서 기본으로는 빼뒀습니다. "
+                 "업체 최적화가 흔히 넣는 값이라 궁금한 분을 위해 남겨둡니다.",
             impact=SMALL,
             affects="끊김",
             group="윈도우",
+            recommended=False,
             action=RegistryAction([
                 RegItem("HKLM",
                         r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile",
@@ -1583,21 +2062,21 @@ def catalog() -> list[Tweak]:
         Tweak(
             key="game_dvr",
             title="배경 녹화(Game DVR) 끄기",
-            what="Xbox Game Bar 가 게임 화면을 늘 몰래 녹화하고 있는 것을 끕니다.",
+            what="Xbox Game Bar 의 게임 녹화 기능을 끕니다. '지난 30초 녹화' 를 켜두면 "
+                 "게임 화면을 늘 몰래 녹화하고 있습니다.",
             gain="이 프로그램에서 프레임 숫자를 실제로 올려주는 거의 유일한 항목입니다. "
-                 "켜져 있었다면 몇 % 를 돌려받습니다. 이미 꺼져 있었으면 변화가 없습니다.",
+                 "배경 녹화가 돌고 있었다면 몇 % 를 돌려받습니다. 안 돌고 있었으면 변화가 "
+                 "거의 없습니다.",
             impact=MID,
             affects="프레임",
             group="윈도우",
+            # 예전에는 HKLM 정책 키(AllowGameDVR)도 썼다. 그걸 쓰면 윈도우 설정 화면에
+            # '일부 설정은 조직에서 관리합니다' 가 떠서 해킹당한 줄 안다. 아래 둘로 충분하다.
             action=RegistryAction([
                 RegItem("HKCU", r"System\GameConfigStore",
                         "GameDVR_Enabled", RegValue(0, DWORD)),
-                RegItem("HKCU", r"Software\Microsoft\Windows\CurrentVersion\GameDVR",
-                        "AppCaptureEnabled", RegValue(0, DWORD)),
-                RegItem("HKLM", r"SOFTWARE\Policies\Microsoft\Windows\GameDVR",
-                        "AllowGameDVR", RegValue(0, DWORD)),
+                RegItem("HKCU", RECORDING_KEY, "AppCaptureEnabled", RegValue(0, DWORD)),
             ]),
-            admin=True,
         ),
         Tweak(
             key="notifications",
@@ -1631,6 +2110,7 @@ def catalog() -> list[Tweak]:
             recommended=False,
             admin=True,
             reboot=True,
+            note="끄면 다른 게임에서 DLSS 프레임 생성(Frame Generation)을 못 씁니다.",
         ),
         # --- 게임 -------------------------------------------------------
         Tweak(
@@ -1658,7 +2138,8 @@ def catalog() -> list[Tweak]:
             action=DefenderExclusionAction(),
             recommended=False,
             admin=True,
-            note="그 폴더는 검사를 안 하게 됩니다. 공식 경로로 설치한 게임에만 쓰세요.",
+            note="그 폴더는 검사를 안 하게 됩니다. 공식 경로로 설치한 게임에만 쓰세요. "
+                 "V3·알약 같은 다른 백신을 쓰고 있으면 윈도우 보안은 쉬고 있어서 의미가 없습니다.",
         ),
     ]
 
@@ -1762,6 +2243,7 @@ class Outcome:
     steps: list = field(default_factory=list)
     record: Path | None = None
     reboot: bool = False
+    more: bool = False          # 되돌리기 뒤에도 되돌릴 기록이 더 남았나
 
     @property
     def done(self) -> int:
@@ -1802,6 +2284,13 @@ class Optimizer:
         return found
 
     def _blocked(self, tweak: Tweak, state: str) -> str:
+        try:
+            reason = tweak.action.skip_reason(self.ctx)
+        except Exception as exc:
+            log.debug("%s 판단 실패: %s", tweak.key, exc)
+            reason = ""
+        if reason:
+            return reason
         if state == NA:
             if tweak.key in ("fullscreen_opt", "priority", "defender"):
                 return "서든어택 설치 폴더를 찾지 못했습니다"
@@ -1826,6 +2315,19 @@ class Optimizer:
         outcome = Outcome()
         entries: dict = {}
         when = datetime.now()
+        if not wanted:
+            return outcome
+
+        # 되돌릴 근거를 못 남기는 곳이면 아무것도 바꾸지 않는다.
+        try:
+            check_writable(self.root)
+        except OSError as exc:
+            log.warning("기록 폴더에 쓸 수 없습니다: %s", exc)
+            outcome.steps.append(Step(
+                "record", "되돌리기 기록", False,
+                f"{backup_folder(self.root)} 에 기록을 남길 수 없어서 아무것도 바꾸지 않았습니다. "
+                "프로그램 폴더를 바탕화면이나 문서 폴더로 옮긴 뒤 다시 실행하세요."))
+            return outcome
 
         for tweak in wanted:
             try:
@@ -1848,11 +2350,25 @@ class Optimizer:
                 outcome.steps.append(Step(tweak.key, tweak.title, False, str(exc)))
                 continue
 
+            # 항목 하나 끝날 때마다 기록을 갱신한다. 중간에 멈춰도 여기까지는 되돌린다.
+            try:
+                outcome.record = save_record(entries, root=self.root, when=when,
+                                             path=outcome.record)
+            except OSError as exc:
+                # 기록을 못 남긴 변경은 되돌릴 근거가 없다. 그 자리에서 되돌리고 멈춘다.
+                log.warning("기록을 남기지 못했습니다: %s", exc)
+                try:
+                    tweak.action.revert(self.ctx, entries.pop(tweak.key))
+                    undone = "방금 바꾼 것은 원래대로 돌려놨습니다"
+                except Exception as undo_exc:
+                    undone = f"방금 바꾼 것도 되돌리지 못했습니다({undo_exc})"
+                outcome.steps.append(Step(tweak.key, tweak.title, False,
+                                          f"기록을 남기지 못해 멈췄습니다. {undone}."))
+                break
+
             outcome.steps.append(Step(tweak.key, tweak.title, True, "적용했습니다"))
             if tweak.reboot:
                 outcome.reboot = True
-            # 항목 하나 끝날 때마다 기록을 갱신한다. 중간에 멈춰도 여기까지는 되돌린다.
-            outcome.record = save_record(entries, root=self.root, when=when)
 
         return outcome
 
@@ -1886,6 +2402,8 @@ class Optimizer:
         if not outcome.failed:
             mark_reverted(record)
         outcome.record = record.path
+        # 두 번에 나눠 적용했으면 기록도 둘이다. 하나 되돌렸다고 다 돌아온 게 아니다.
+        outcome.more = not outcome.failed and latest_record(self.root) is not None
         return outcome
 
 
@@ -1963,8 +2481,13 @@ def _verdict_for(tweak: Tweak, spec) -> tuple[str, str]:
         return BIG, ("마우스 가속이 켜져 있습니다. 지금은 손을 빨리 움직일수록 조준이 더 "
                      "많이 돕니다. 끄면 같은 거리가 언제나 같은 만큼이 됩니다.")
     if tweak.key == "game_dvr":
-        return MID, ("배경 녹화가 켜져 있습니다. 게임 화면을 늘 몰래 녹화하고 있다는 뜻이고, "
-                     "끄면 그만큼 프레임을 돌려받습니다.")
+        # 녹화 기능이 켜져 있는 것과 실제로 녹화가 도는 것은 다르다. 앞의 것만 보고
+        # "늘 몰래 녹화하고 있습니다" 라고 하면 부풀리는 것이다.
+        if spec.recording:
+            return MID, ("'지난 30초 녹화' 가 켜져 있습니다. 게임 화면을 늘 녹화하고 있다는 "
+                         "뜻이고, 끄면 그만큼 프레임을 돌려받습니다.")
+        return SMALL, ("녹화 기능은 켜져 있지만 배경 녹화는 돌고 있지 않습니다. 끄면 녹화 "
+                       "단축키가 막히는 정도이고, 프레임 차이는 거의 없습니다.")
     return tweak.impact, tweak.gain
 
 
@@ -2036,7 +2559,9 @@ IN_GAME = Section(
         ("그림자 · 효과 · 안티앨리어싱", "낮음 또는 끄기. 프레임도 오르지만 적을 가리는 "
                                 "화면 요소가 줄어드는 이득이 더 큽니다."),
         ("프레임 제한", "게임 안에서는 해제. 제한이 필요하면 그래픽카드 드라이버에서 "
-                    "거는 쪽이 프레임 간격이 고릅니다."),
+                    "거는 쪽이 프레임 간격이 고릅니다. 제한을 건 뒤 게임이 느리게 "
+                    "(슬로우모션처럼) 느껴지면 그 제한은 푸세요 — 오래된 게임은 프레임 "
+                    "제한과 궁합이 안 맞기도 합니다."),
         ("마우스 감도", "게임 안에서만 조절하세요. 윈도우 포인터 속도는 가운데(6단)에 "
                     "두는 것이 1:1 로 전달됩니다."),
     ],
@@ -2047,8 +2572,15 @@ NVIDIA = Section(
     lead="NVIDIA 앱 → 그래픽 → 전역 설정. "
          "예전 NVIDIA 제어판은 단종됐고 설정이 앱 안으로 옮겨졌습니다.",
     items=[
-        ("전원 관리 모드", "최고 성능 선호 — 그래픽카드가 한가하다고 클럭을 낮추는 걸 막습니다"),
-        ("저지연 모드", "켬 — 렌더 대기열을 줄여 입력이 빨리 반영됩니다"),
+        ("전원 관리 모드",
+         "최고 성능 선호 — 그래픽카드가 한가하다고 클럭을 낮추는 걸 막습니다. 전역에 걸면 "
+         "바탕화면에서도 클럭이 안 내려가 전기·열이 늘어서, '프로그램 설정' 에서 서든어택에만 "
+         "거는 쪽이 깔끔합니다."),
+        ("저지연 모드",
+         "G-SYNC 를 쓰면 '울트라', 안 쓰면 '켬'. 렌더 대기열을 줄여 입력이 빨리 반영됩니다. "
+         "울트라는 G-SYNC·수직 동기와 같이 켜져 있으면 프레임을 주사율 조금 아래로 알아서 "
+         "묶어줍니다 (180Hz 면 171, 144Hz 면 138). 다른 게임에서 171 에 딱 멈춰 있는 게 "
+         "이것 때문이고, 정상입니다."),
         ("수직 동기",
          "★ G-SYNC 를 쓰면 '켜기', 안 쓰면 '끄기'. 이게 갈립니다. "
          "G-SYNC 없이 켜면 프레임이 버퍼에 쌓여서 정말로 무거워집니다. "
@@ -2056,8 +2588,9 @@ NVIDIA = Section(
          "순간에만 깨어나 찢어짐을 막는 안전망이 됩니다. "
          "어느 쪽이든 게임 안 수직 동기는 끄세요."),
         ("최대 프레임 속도",
-         "G-SYNC 를 쓰면 주사율보다 3 정도 낮게 (180Hz 면 177). 그래야 G-SYNC 구간 "
-         "안에 머뭅니다. 저지연 모드가 알아서 걸어주기도 하니 억지로 안 맞춰도 됩니다."),
+         "저지연 모드를 울트라로 뒀다면 끔 — 위에서 이미 알아서 묶어줍니다. 울트라를 안 "
+         "쓰고 G-SYNC 를 쓸 때만 주사율보다 3 정도 낮게 (180Hz 면 177). 걸었더니 서든어택이 "
+         "느리게 느껴지면 '프로그램 설정 → 서든어택' 에서만 끄세요."),
         ("텍스처 필터링 · 셰이더 캐시",
          "기본값 그대로 두세요. 옛날 가이드는 '고성능'으로 바꾸라고 하는데 그건 "
          "그래픽카드가 부족할 때 얘기입니다. 이 게임에서는 카드가 놀고 있어서 "
@@ -2119,12 +2652,49 @@ VRR = Section(
          "NVIDIA 앱에서 G-SYNC 표시기를 켜고 게임을 실행해 보세요. 화면 구석에 표시가 "
          "뜨면 성공입니다. 옛날 게임은 화면을 내보내는 방식이 달라서 안 물리기도 합니다."),
         ("④ 되면 같이 맞출 것",
-         "드라이버 수직 동기를 '켜기' 로, 최대 프레임 속도를 주사율보다 3 정도 낮게. "
-         "셋이 한 세트입니다. 게임 안 수직 동기는 계속 끄세요."),
+         "드라이버 수직 동기 '켜기' + 저지연 모드 '울트라'. 그러면 프레임이 주사율 조금 "
+         "아래로 알아서 묶여서 G-SYNC 구간 안에 머뭅니다. 게임 안 수직 동기는 계속 끄세요."),
         ("MBR · 모션 블러 감소와는 같이 못 씁니다",
          "원리가 반대라 하나를 켜면 다른 하나가 꺼집니다. MBR 은 움직임이 또렷해지는 "
          "대신 화면이 어두워집니다. 둘 다 써보고 고르세요."),
         ("케이블", "DisplayPort 를 쓰세요. 오래된 HDMI 케이블은 주사율이 막힙니다."),
+    ],
+)
+
+DEVICES = Section(
+    title="키보드 · 마우스 (직접)",
+    lead="키보드·마우스 전용 프로그램에서 바꾸는 것들입니다. 래피드 트리거는 자석축(래피드 "
+         "트리거 지원) 키보드에만 있습니다.",
+    items=[
+        ("폴링 레이트", "1000Hz. 4000·8000Hz 는 CPU 를 더 먹고, 오래된 게임에서는 오히려 끊김이 "
+                    "생기기도 합니다. 1000 이면 1ms 마다 보고라 충분합니다."),
+        ("래피드 트리거 — 이동키(A·D)",
+         "여기에만 거세요. 손을 조금만 떼도 바로 멈춰서 좌우 무빙이 빨라집니다."),
+        ("래피드 트리거 — 한 번만 눌러야 하는 키",
+         "뒤돌기(F)·장전(R)·무기 교체 같은 키는 끄세요. 너무 예민해서 한 번 누른 게 두 번 "
+         "들어가 두 번 돌아버립니다. 작동 지점은 2.0mm 이상으로 깊게 두면 안정적입니다."),
+        ("디바운스(반복 입력 방지)",
+         "최소로 두세요. 올리면 두 번 눌림은 줄지만, 빠르게 연타한 입력을 삼켜서 키가 씹힌 "
+         "것처럼 느껴집니다. 두 번 눌림은 위처럼 작동 지점으로 잡는 게 낫습니다."),
+        ("SOCD · 스냅탭",
+         "양쪽을 같이 누르면 나중 키만 인정하는 기능입니다. 발로란트·카운터스트라이크는 공식적"
+         "으로 막았고, 서든어택은 따로 발표가 없습니다. 쓰다가 움직임이 뚝뚝 끊기는 느낌이면 "
+         "끄세요."),
+    ],
+)
+
+OVERLAYS_GUIDE = Section(
+    title="오버레이 끄기 (직접)",
+    lead="게임 화면 위에 뭔가를 그려 넣는 프로그램들입니다. 키가 가끔 씹히거나, 로비는 "
+         "괜찮은데 교전 중에만 순간 끊기면 가장 먼저 의심할 곳입니다.",
+    items=[
+        ("Discord", "사용자 설정 → 게임 오버레이 → '게임 내 오버레이 활성화' 끄기. "
+                    "음성 채팅은 그대로 됩니다."),
+        ("NVIDIA 앱", "설정 → 기능 → NVIDIA 오버레이. 녹화·인스턴트 리플레이·성능 표시를 안 "
+                     "쓰면 끄세요."),
+        ("Xbox Game Bar", "이 프로그램의 '배경 녹화 끄기' 가 녹화 쪽은 막습니다. 바 자체는 "
+                          "윈도우 설정 → 게임 → Game Bar 에서 끌 수 있습니다."),
+        ("애프터버너(RivaTuner) · OBS", "프레임 표시나 방송을 안 할 때는 꺼두세요."),
     ],
 )
 
@@ -2142,6 +2712,16 @@ AVOIDED = Section(
                                  "지운 것을 되돌릴 수도 없습니다."),
         ("게임 파일 자체 수정", "게임을 바꾸는 일이라 계정이 막힐 수 있습니다. "
                         "이 프로그램은 윈도우 설정만 건드립니다."),
+        ("메모리 무결성(코어 격리) 끄기", "그래픽카드가 모자란 무거운 게임에서는 몇 % 차이가 "
+                                   "나기도 합니다. 서든어택은 프레임이 남아서 얻을 게 없고, "
+                                   "악성 드라이버를 막는 방어만 꺼집니다."),
+        ("CPU 보안 패치 끄기 (Spectre·Meltdown)", "요즘 CPU 에서는 성능 차이가 거의 없습니다. "
+                                            "보안 구멍만 열립니다."),
+        ("타이머 해상도 고정 프로그램", "윈도우 10(2004) 부터는 한 프로그램이 바꾼 타이머가 다른 "
+                                 "프로그램에 번지지 않게 바뀌었습니다. 옛날 방식이라 게임에는 "
+                                 "닿지 않습니다."),
+        ("레지스트리 '네트워크 최적화' 값들 (TcpWindowSize 등)", "윈도우 비스타부터는 윈도우가 "
+                                 "알아서 맞추고 이 값들을 읽지도 않습니다."),
     ],
 )
 
@@ -2162,9 +2742,7 @@ def guide_sections(spec=None) -> list[Section]:
     if not picked:
         # 그래픽카드를 못 읽었으면 셋 다 보여준다. 골라 읽으시면 된다.
         chosen.extend([NVIDIA, AMD, INTEL])
-    chosen.append(VRR)
-    chosen.append(MONITOR)
-    chosen.append(AVOIDED)
+    chosen.extend([VRR, MONITOR, DEVICES, OVERLAYS_GUIDE, AVOIDED])
     return chosen
 
 
@@ -2186,11 +2764,21 @@ def esc(value) -> str:
 
 
 class Screen:
+    # 점검(메모리·연결·오버레이)은 PowerShell 을 불러서 1초쯤 걸린다. 버튼 하나 누를
+    # 때마다 다시 읽을 필요는 없어서 잠깐 기억해 둔다.
+    CHECKS_FOR = 30
+
     def __init__(self, optimizer: Optimizer, root=None):
         self.optimizer = optimizer
         self.root = root
         self.notice = ""
         self.result = None
+        self.ping = None                # 마지막으로 잰 핑 (Check)
+        self.closing = False            # 관리자 창을 새로 띄웠으면 이 창은 물러난다
+        # 이 화면에서 누른 버튼인지 확인하는 표. 다른 웹사이트는 이 값을 알 수 없다.
+        self.token = secrets.token_urlsafe(24)
+        self._checks = None
+        self._checked_at = 0.0
         self._lock = threading.Lock()
 
     # --- 화면 ---------------------------------------------------------
@@ -2207,27 +2795,41 @@ class Screen:
             _result(self.result),
             _hero(ready, statuses),
             _verdicts_box(statuses, spec),
+            _checks_box(self.checks(spec), self.ping, ctx.windows),
             _basics(spec),
             _game_box(ctx),
             _items(statuses),
-            _revert_box(record, record_history(self.root)),
+            _revert_box(record, record_history(self.root), ctx.admin),
             _guide(spec),
-            _footer(),
+            _footer(self.root),
         ]
-        return _PAGE.format(style=_STYLE, body="\n".join(body))
+        return _with_token(_PAGE.format(style=_STYLE, body="\n".join(body)), self.token)
 
-    def render_bye(self) -> str:
+    def render_bye(self, message: str = "이 창은 닫으셔도 됩니다.") -> str:
         return _PAGE.format(
             style=_STYLE,
             body='<div class="card center"><h2>끝났습니다</h2>'
-                 "<p class=muted>이 창은 닫으셔도 됩니다.</p></div>",
+                 f"<p class=muted>{esc(message)}</p></div>",
         )
+
+    def checks(self, spec) -> list:
+        now = time.monotonic()
+        if self._checks is None or now - self._checked_at > self.CHECKS_FOR:
+            self._checks = system_checks(self.optimizer.ctx, spec)
+            self._checked_at = now
+        return self._checks
 
     # --- 버튼 ---------------------------------------------------------
     def run(self, action: str, params: dict) -> str:
         # 두 번 눌러도 한 번씩 차례로 처리한다. 겹쳐 돌면 되돌리기 기록이 엉킨다.
         with self._lock:
-            return self._run(action, params)
+            try:
+                return self._run(action, params)
+            except Exception as exc:
+                # 여기서 터지면 브라우저에는 빈 화면만 뜬다. 무슨 일인지 말은 해준다.
+                log.exception("%s 처리 중 오류", action)
+                self.result = None
+                return f"처리하다 문제가 생겼습니다: {exc}"
 
     def _run(self, action: str, params: dict) -> str:
         if action == "apply_all":
@@ -2249,20 +2851,33 @@ class Screen:
             self.result = self.optimizer.revert(record)
             if not self.result.steps:
                 return "되돌릴 것이 없었습니다."
-            return f"{self.result.done}개를 원래대로 되돌렸습니다."
+            message = f"{self.result.done}개를 원래대로 되돌렸습니다."
+            if self.result.more:
+                message += " 그 전에 바꾼 기록이 하나 더 있습니다 — 한 번 더 누르면 그것도 되돌립니다."
+            return message
         if action == "game_path":
-            value = (params.get("path") or [""])[0].strip()
+            value = clean_path((params.get("path") or [""])[0])
             remember_game_path(value, self.root)
             self.optimizer.ctx.install = _find(self.optimizer.ctx, value)
             self.result = None
             if self.optimizer.ctx.install:
                 return f"찾았습니다: {self.optimizer.ctx.install.exe}"
             return "그 경로에서 실행 파일을 못 찾았습니다. 서든어택 폴더나 exe 를 넣어주세요."
+        if action == "recheck":
+            self.result = None
+            self._checks = None
+            return "다시 점검했습니다."
+        if action == "ping":
+            self.result = None
+            self.ping = ping_check(measure_ping(self.optimizer.ctx.shell))
+            return "핑을 쟀습니다. 아래 '점검' 칸을 보세요."
         if action == "admin":
             self.result = None
-            if relaunch_as_admin(sys.argv[0]):
-                return "관리자 권한으로 새 창을 띄웠습니다. 이 창은 닫으셔도 됩니다."
-            return "관리자 권한으로 다시 띄우지 못했습니다. 시작 파일을 우클릭 → 관리자 권한으로 실행 해주세요."
+            if relaunch_as_admin():
+                self.closing = True
+                return "관리자 권한으로 새 창을 띄웠습니다. 이 탭은 닫으셔도 됩니다."
+            return ("관리자 권한으로 다시 띄우지 못했습니다. 프로그램을 우클릭 → "
+                    "'관리자 권한으로 실행' 해주세요.")
         return ""
 
     def _record(self, which: str):
@@ -2435,7 +3050,8 @@ def _basics(spec) -> str:
 <div class="g-row"><b>① 모니터가 몇 장 보여주나</b><span>주사율 — 셋 중 제일 큽니다</span></div>
 <div class="g-row"><b>② 내 손이 화면에 얼마나 빨리 나타나나</b>
 <span>마우스 가속, 전체 화면 최적화</span></div>
-<div class="g-row"><b>③ 쏜 게 서버에 얼마나 빨리 닿나</b><span>Nagle, 네트워크 제한</span></div>
+<div class="g-row"><b>③ 쏜 게 서버에 얼마나 빨리 닿나</b><span>랜선인지 와이파이인지, 회선이 고른지 —
+윈도우 설정보다 이쪽이 훨씬 큽니다. 위 '점검' 칸에서 핑을 재볼 수 있습니다</span></div>
 
 <h4>숫자로 보면</h4>
 <p>60Hz 는 장면 하나가 <b>16.7ms</b> 동안 그대로 멈춰 있습니다. 그래서 방금 일어난 일이
@@ -2524,7 +3140,7 @@ def _item(status) -> str:
     )
 
 
-def _revert_box(record, records) -> str:
+def _revert_box(record, records, admin: bool = True) -> str:
     if record is None:
         past = ""
         if records:
@@ -2534,7 +3150,14 @@ def _revert_box(record, records) -> str:
                 '<p class="muted">아직 바꾼 것이 없어서 되돌릴 것도 없습니다.</p>'
                 f"{past}</section>")
 
-    changed = ", ".join(record.keys[:6]) + (" …" if len(record.keys) > 6 else "")
+    # 기록 안의 이름은 mouse_accel 같은 속 이름이다. 사람이 읽는 제목으로 바꿔 보여준다.
+    known = by_key()
+    titles = [known[key].title if key in known else key for key in record.keys]
+    changed = ", ".join(titles[:6]) + (" …" if len(titles) > 6 else "")
+    warn = ""
+    if not admin and any(known[key].admin for key in record.keys if key in known):
+        warn = ('<p class="warn-inline">이 기록에는 관리자 권한이 있어야 되돌릴 수 있는 항목이 '
+                "있습니다. 관리자 권한으로 다시 실행한 뒤 누르세요.</p>")
     others = ""
     rest = [r for r in records if r.path != record.path]
     if rest:
@@ -2546,7 +3169,7 @@ def _revert_box(record, records) -> str:
     return (
         '<section class="card"><h3>되돌리기</h3>'
         f'<p><b>{esc(record.label)}</b> 에 {len(record.keys)}개를 바꿨습니다.</p>'
-        f'<p class="muted small">{esc(changed)}</p>'
+        f'<p class="muted small">{esc(changed)}</p>{warn}'
         '<form method="post" action="/action" onsubmit="wait(this)">'
         '<input type="hidden" name="action" value="revert">'
         f'<input type="hidden" name="record" value="{esc(record.path.name)}">'
@@ -2587,12 +3210,50 @@ def _result(outcome) -> str:
     return f'<section class="card result"><h3>{esc(outcome.summary)}</h3><ul>{rows}</ul>{reboot}</section>'
 
 
-def _footer() -> str:
+def _footer(root=None) -> str:
     return (
         '<footer class="muted small">서든어택 최적화 v'
-        f"{esc(__version__)} · 바꾼 값은 <code>backup/</code> 폴더에 기록됩니다 · "
+        f"{esc(__version__)} · 바꾼 값은 <code>{esc(backup_folder(root))}</code> 에 기록됩니다 · "
         "게임 파일은 건드리지 않습니다</footer>"
     )
+
+
+def _checks_box(found, ping, windows: bool) -> str:
+    """점검 — 버튼으로는 못 고치는 것. 읽기만 한다."""
+    if not windows:
+        return ""
+    rows = list(found) + ([ping] if ping else [])
+    lines = "".join(
+        f'<div class="c-row"><span class="c-mark {esc(c.level)}">{esc(c.label)}</span>'
+        f"<div><b>{esc(c.title)}</b><span>{esc(c.line)}</span></div></div>"
+        for c in rows
+    )
+    if not lines:
+        lines = '<p class="muted small">읽어온 것이 없습니다.</p>'
+    return (
+        '<section class="card checks"><h3>점검 — 버튼으로는 못 고치는 것</h3>'
+        '<p class="muted small">읽기만 하고 아무것도 바꾸지 않습니다. 바이오스·랜선·다른 '
+        "프로그램 설정처럼 이 프로그램이 대신 못 하는 곳에 문제가 있으면 여기 뜹니다.</p>"
+        f"{lines}"
+        '<div class="c-bar">'
+        '<form method="post" action="/action" class="inline" onsubmit="wait(this)">'
+        '<input type="hidden" name="action" value="ping">'
+        '<button class="mini" data-wait="재는 중… (10초)">핑 재기 (10초)</button></form> '
+        '<form method="post" action="/action" class="inline">'
+        '<input type="hidden" name="action" value="recheck">'
+        '<button class="mini">다시 점검</button></form>'
+        f'<span class="muted small">핑은 게임 서버가 아니라 {esc(PING_HOST)} 까지 잽니다. '
+        "평균보다 흔들림과 손실을 보세요.</span></div></section>"
+    )
+
+
+def _with_token(page: str, token: str) -> str:
+    """모든 버튼 폼에 이 화면의 표를 끼워 넣는다.
+
+    폼마다 손으로 넣으면 새 버튼을 만들 때 빠뜨린다. 여기서 한꺼번에 넣으면 빠질 수가 없다.
+    """
+    hidden = f'<input type="hidden" name="token" value="{esc(token)}">'
+    return re.sub(r"<form\b[^>]*>", lambda found: found.group(0) + hidden, page)
 
 
 # ---------------------------------------------------------------------------
@@ -2709,11 +3370,22 @@ details.g summary { cursor:pointer; font-weight:600; }
 .g-row b { min-width:180px; font-weight:600; }
 .g-row span { color:var(--muted); flex:1; }
 footer { margin-top:28px; text-align:center; }
+.c-row { display:flex; gap:10px; align-items:flex-start; padding:9px 0;
+  border-top:1px solid var(--line); }
+.c-row > div { display:flex; flex-direction:column; gap:2px; min-width:0; }
+.c-row span:not(.c-mark) { color:var(--muted); font-size:.88rem; }
+.c-mark { font-size:.72rem; font-weight:700; padding:1px 8px; border-radius:999px;
+  white-space:nowrap; margin-top:3px; border:1px solid var(--line); }
+.c-mark.warn { background:var(--warnbg); color:var(--warn); border-color:var(--warn); }
+.c-mark.good { color:var(--ok); border-color:var(--ok); }
+.c-bar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:12px; }
 input[type=text], input:not([type]) { font:inherit; padding:6px 10px; border-radius:8px;
   border:1px solid var(--line); background:var(--bg); color:var(--fg); }
 """
 
-_PAGE = """<meta charset="utf-8">
+_PAGE = """<!doctype html>
+<html lang="ko">
+<meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>서든어택 최적화</title>
 <style>{style}</style>
@@ -2722,7 +3394,7 @@ _PAGE = """<meta charset="utf-8">
 // 되돌리기 기록이 두 개 생긴다. 누른 순간 버튼을 잠근다.
 function wait(form) {{
   var button = form.querySelector('button');
-  if (button) {{ button.disabled = true; button.textContent = '하는 중…'; }}
+  if (button) {{ button.disabled = true; button.textContent = button.dataset.wait || '하는 중…'; }}
 }}
 </script>
 {body}
@@ -2732,16 +3404,40 @@ function wait(form) {{
 # ---------------------------------------------------------------------------
 class _Handler(BaseHTTPRequestHandler):
     screen: Screen = None
+    MAX_BODY = 64 * 1024
 
     def log_message(self, fmt, *args):
         log.debug("화면 %s", fmt % args)
 
     def _guard(self) -> bool:
-        # 이 프로그램은 컴퓨터 설정을 바꾼다. 같은 컴퓨터에서 연 것만 받는다.
+        """이 프로그램은 컴퓨터 설정을 바꾼다. 이 컴퓨터에서, 이 주소로 연 것만 받는다.
+
+        주소(Host) 까지 보는 이유 — 나쁜 웹사이트가 자기 도메인을 127.0.0.1 로 돌려
+        붙이는 수법(DNS 리바인딩)이 있다. 그러면 IP 는 맞아도 Host 가 그 사이트 이름이다.
+        """
         if self.client_address[0] not in ("127.0.0.1", "::1"):
             self.send_error(403, "localhost only")
             return False
+        port = self.server.server_address[1]
+        host = (self.headers.get("Host") or "").strip().lower()
+        if host not in (f"127.0.0.1:{port}", f"localhost:{port}"):
+            self.send_error(403, "wrong host")
+            return False
         return True
+
+    def _same_page(self, params: dict) -> bool:
+        """누른 버튼이 이 프로그램 화면에 있던 것인가.
+
+        다른 웹사이트도 이 주소로 폼을 몰래 보낼 수는 있다(CSRF). 하지만 화면에 숨겨둔
+        표(token)는 모른다. 표가 없거나 틀리면 아무것도 하지 않는다.
+        """
+        port = self.server.server_address[1]
+        origin = self.headers.get("Origin")
+        if origin is not None and origin.lower() not in (
+                f"http://127.0.0.1:{port}", f"http://localhost:{port}"):
+            return False
+        token = (params.get("token") or [""])[0]
+        return hmac.compare_digest(token.encode("utf-8"), self.screen.token.encode("utf-8"))
 
     def do_GET(self):
         if not self._guard():
@@ -2760,20 +3456,36 @@ class _Handler(BaseHTTPRequestHandler):
         if urlparse(self.path).path != "/action":
             self.send_error(404)
             return
-        length = int(self.headers.get("Content-Length") or 0)
-        params = parse_qs(self.rfile.read(length).decode("utf-8"))
-        action = (params.get("action") or [""])[0]
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if not 0 <= length <= self.MAX_BODY:
+            self.send_error(400)
+            return
+        params = parse_qs(self.rfile.read(length).decode("utf-8", errors="replace"))
+        if not self._same_page(params):
+            # 예전에 띄운 창의 탭에서 누른 경우도 여기로 온다. 새로 고치면 된다.
+            self._html('<meta charset="utf-8"><p>이 버튼은 지금 화면에서 누른 게 아닙니다. '
+                       '<a href="/">새로 고침</a> 후 다시 눌러주세요.</p>', status=403)
+            return
 
+        action = (params.get("action") or [""])[0]
         self.screen.notice = self.screen.run(action, params)
+        if self.screen.closing:
+            # 관리자 권한으로 새 창이 떴다. 이 창은 물러나야 창이 두 개로 헷갈리지 않는다.
+            self._html(self.screen.render_bye(self.screen.notice))
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
+            return
         self.send_response(303)
         self.send_header("Location", "/")
         self.end_headers()
 
-    def _html(self, text: str):
-        self._respond(text.encode("utf-8"), "text/html; charset=utf-8")
+    def _html(self, text: str, status: int = 200):
+        self._respond(text.encode("utf-8"), "text/html; charset=utf-8", status)
 
-    def _respond(self, payload: bytes, content_type: str):
-        self.send_response(200)
+    def _respond(self, payload: bytes, content_type: str, status: int = 200):
+        self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", "no-store")
@@ -2824,17 +3536,46 @@ def build_optimizer(root: Path = ROOT) -> Optimizer:
     return Optimizer(build_context(root), root=root)
 
 
+def first_run(root: Path = ROOT) -> bool:
+    """이 컴퓨터에서 처음 켜는가. 적용했든 되돌렸든 기록이 하나라도 있으면 처음이 아니다."""
+    return not record_history(root)
+
+
+def auto_apply(screen: Screen) -> bool:
+    """처음 켰으면 이 컴퓨터에 맞는 권장 항목을 알아서 적용한다.
+
+    exe 를 받아서 더블클릭만 한 사람도 끝까지 가게 하려는 것이다. 다만
+      · 두 번째부터는 하지 않는다 — 되돌리러 들어온 사람에게 다시 적용해버리면 안 된다.
+      · 관리자 권한이 없으면 하지 않는다 — 절반만 적용된 채 '처음' 이 끝나버린다.
+    어떤 항목을 넣고 뺄지는 [8] 의 판단(이 컴퓨터에 해당하나, 이미 됐나)을 그대로 따른다.
+    """
+    optimizer = screen.optimizer
+    if not (optimizer.ctx.windows and optimizer.ctx.admin and first_run(optimizer.root)):
+        return False
+    keys = optimizer.recommended_keys()
+    if not keys:
+        return False
+    screen.result = optimizer.apply(keys)
+    screen.notice = ("처음 실행이라 이 컴퓨터에 맞는 설정을 알아서 적용했습니다 "
+                     f"({screen.result.summary}). 마음에 안 들면 아래 '원래대로 되돌리기' 를 "
+                     "누르면 전부 원래대로 돌아옵니다.")
+    return True
+
+
 def cmd_screen(args) -> int:
     optimizer = build_optimizer()
     screen = Screen(optimizer, root=ROOT)
+    applied = False if args.no_auto else auto_apply(screen)
     server, url = start_screen(screen, port=args.port, open_browser=not args.no_browser)
 
     print()
     print("  서든어택 최적화 v" + __version__)
     print("  화면:", url)
+    if applied:
+        print("  처음 실행이라 권장 설정을 적용했습니다 —", screen.result.summary)
     if WINDOWS and not is_admin():
         print("  ! 관리자 권한이 아닙니다 — 일부 항목이 잠깁니다.")
-        print("    바탕화면의 시작 파일을 우클릭 → '관리자 권한으로 실행' 하시면 전부 풀립니다.")
+        print("    프로그램을 우클릭 → '관리자 권한으로 실행' 하시면 전부 풀립니다.")
     print()
     print("  이 창을 닫거나 Ctrl+C 를 누르면 끝납니다.")
     print()
@@ -2870,6 +3611,12 @@ def cmd_status(args) -> int:
         note = f"  ({status.blocked})" if status.blocked else ""
         print(f"  {marks.get(status.state, '[  ?  ]')} {status.tweak.title}{note}")
 
+    found = system_checks(ctx, spec)
+    if found:
+        print()
+        for check in found:
+            print(f"  [{check.label}] {check.title} — {check.line}")
+
     record = latest_record(ROOT)
     print()
     if record:
@@ -2881,6 +3628,12 @@ def cmd_status(args) -> int:
 
 def cmd_apply(args) -> int:
     optimizer = build_optimizer()
+    known = by_key()
+    unknown = [key for key in args.only or [] if key not in known]
+    if unknown:
+        print(f"  모르는 항목: {', '.join(unknown)}")
+        print(f"  있는 항목: {', '.join(known)}")
+        return 2
     keys = args.only or optimizer.recommended_keys()
     if not keys:
         print("  바꿀 것이 없습니다. 이미 다 되어 있습니다.")
@@ -2893,8 +3646,8 @@ def cmd_apply(args) -> int:
     print()
     print("  " + outcome.summary)
     if outcome.record:
-        print(f"  되돌리기 기록: {outcome.record.name}")
-        print("  되돌리려면: 되돌리기.bat 을 더블클릭하거나 python optimizer.py revert")
+        print(f"  되돌리기 기록: {outcome.record}")
+        print("  되돌리려면: 화면의 '원래대로 되돌리기' 버튼, 또는 revert 명령")
     return 0 if not outcome.failed else 1
 
 
@@ -2909,6 +3662,8 @@ def cmd_revert(args) -> int:
         print(f"  {'O' if step.ok else 'X'}  {step.title} — {step.message}")
     print()
     print(f"  {outcome.done}개를 원래대로 되돌렸습니다.")
+    if outcome.more:
+        print("  그 전에 바꾼 기록이 하나 더 있습니다. 한 번 더 실행하면 그것도 되돌립니다.")
     return 0 if not outcome.failed else 1
 
 
@@ -2918,11 +3673,15 @@ def main(argv=None) -> int:
         prog="sudden", description="서든어택 최적화 — 윈도우 설정을 게임에 맞게 한 번에"
     )
     parser.add_argument("--verbose", action="store_true", help="자세한 기록 출력")
+    parser.add_argument("--version", action="version", version=f"서든어택 최적화 {__version__}")
+    # 관리자 권한으로 다시 뜬 쪽에 붙는다. 또 물어보는 일이 없게.
+    parser.add_argument("--elevated", action="store_true", help=argparse.SUPPRESS)
     sub = parser.add_subparsers(dest="command")
 
     screen = sub.add_parser("screen", help="화면 띄우기 (기본)")
     screen.add_argument("--port", type=int, default=8770)
     screen.add_argument("--no-browser", action="store_true")
+    screen.add_argument("--no-auto", action="store_true", help="처음 실행이어도 자동 적용 안 함")
     screen.set_defaults(func=cmd_screen)
 
     sub.add_parser("status", help="지금 상태 보기").set_defaults(func=cmd_status)
@@ -2939,8 +3698,14 @@ def main(argv=None) -> int:
         format="%(levelname)-7s %(name)s: %(message)s",
     )
     if not getattr(args, "func", None):
-        args.port, args.no_browser = 8770, False
-        return cmd_screen(args)
+        args.port, args.no_browser, args.no_auto = 8770, False, False
+        args.func = cmd_screen
+
+    # exe 를 더블클릭한 경우 — 배치 파일이 없으니 관리자 권한은 프로그램이 직접 묻는다.
+    # '아니요' 를 누르면 일반 권한으로 그대로 뜬다 (관리자 항목만 잠긴다).
+    if (FROZEN and WINDOWS and args.func is cmd_screen and not args.elevated
+            and not is_admin() and relaunch_as_admin()):
+        return 0
     return args.func(args)
 
 

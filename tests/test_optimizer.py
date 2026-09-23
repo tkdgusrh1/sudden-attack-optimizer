@@ -27,9 +27,12 @@ from optimizer import (  # noqa: E402
     Context, FakeDisplay, FakeRegistry, FakeShell, Install, Monitor, RegValue, Result,
     Optimizer, Screen, Shell, Tweak, catalog,
     DONE, LOCKED, MID, SMALL, verdicts,
-    RECORD_PREFIX, _decode, _parse_scheme,
+    GOOD, INFO, WARN, Spec, auto_apply, battery_check, clean_path, memory_check,
+    network_check, overlay_check, parse_ping, ping_check, ps_literal, read_hardware,
+    running_programs, system_checks, too_broad,
+    RECORD_PREFIX, _decode, _parse_scheme, _with_token,
     backup_folder, by_key, find_game, latest_record, record_history,
-    remember_game_path, saved_game_path, spec_of,
+    remember_game_path, save_record, saved_game_path, spec_of,
 )
 
 
@@ -109,7 +112,7 @@ class FakeWindows(FakeShell):
     def _defender(self, script: str) -> Result:
         if "Get-MpPreference" in script:
             return Result(ok=True, out="\n".join(self.exclusions))
-        path = script.split('"')[1] if '"' in script else ""
+        path = ps_unquote(script)
         if "Add-MpPreference" in script:
             if path and path not in self.exclusions:
                 self.exclusions.append(path)
@@ -118,6 +121,25 @@ class FakeWindows(FakeShell):
             self.exclusions = [p for p in self.exclusions if p != path]
             return Result(ok=True)
         return Result(ok=True)
+
+
+def ps_unquote(script: str) -> str:
+    """PowerShell 이 읽는 그대로 첫 작은따옴표 문자열을 꺼낸다. 큰따옴표는 인정하지 않는다."""
+    quotes = "'\u2018\u2019\u201a\u201b"
+    start = next((i for i, ch in enumerate(script) if ch in quotes), None)
+    if start is None:
+        return ""
+    out, i = [], start + 1
+    while i < len(script):
+        if script[i] in quotes:
+            if i + 1 < len(script) and script[i + 1] in quotes:
+                out.append(script[i + 1])
+                i += 2
+                continue
+            break
+        out.append(script[i])
+        i += 1
+    return "".join(out)
 
 
 def fake_context(*, admin=True, windows=True, install=True, monitors=True,
@@ -242,7 +264,9 @@ def test_a_missing_command_is_a_failure_not_a_crash():
 
 
 def test_a_command_that_runs(tmp_path):
-    result = Shell().run(["echo", "안녕"])
+    # echo 는 윈도우에서 실행 파일이 아니라 cmd 안의 명령이라, 어디서나 있는 파이썬으로 부른다
+    script = "import sys; sys.stdout.buffer.write('안녕'.encode('utf-8'))"
+    result = Shell().run([sys.executable, "-c", script])
     assert result.ok and result.out == "안녕"
 
 
@@ -374,8 +398,6 @@ def test_number_and_text_zero_are_the_same_value():
     ctx.registry.write("HKCU", r"System\GameConfigStore", "GameDVR_Enabled", RegValue("0", STR))
     ctx.registry.write("HKCU", r"Software\Microsoft\Windows\CurrentVersion\GameDVR",
                        "AppCaptureEnabled", RegValue(0, DWORD))
-    ctx.registry.write("HKLM", r"SOFTWARE\Policies\Microsoft\Windows\GameDVR",
-                       "AllowGameDVR", RegValue(0, DWORD))
     assert find("game_dvr").action.state(ctx) == ON
 
 
@@ -433,7 +455,8 @@ def test_power_plan_duplicates_instead_of_editing_the_current_one():
     assert ctx.shell.active == record["created"] != BALANCED
     assert ctx.shell.schemes[record["created"]] == "서든어택 최적화"
     assert BALANCED not in ctx.shell.tuned, "균형 조정 계획에는 값을 쓴 적이 없어야 한다"
-    assert len(ctx.shell.tuned[record["created"]]) == 10   # 항목 5개 × (AC·배터리)
+    # 항목 5개 × (AC·배터리) 인데, 프로세서 최소 100% 는 전원을 꽂았을 때만 건다
+    assert len(ctx.shell.tuned[record["created"]]) == 9
     assert tweak.action.state(ctx) == ON
 
 
@@ -945,8 +968,6 @@ def test_settings_already_the_way_we_want_are_reported_as_done():
     ctx.registry.write("HKCU", r"System\GameConfigStore", "GameDVR_Enabled", RegValue(0, DWORD))
     ctx.registry.write("HKCU", r"Software\Microsoft\Windows\CurrentVersion\GameDVR",
                        "AppCaptureEnabled", RegValue(0, DWORD))
-    ctx.registry.write("HKLM", r"SOFTWARE\Policies\Microsoft\Windows\GameDVR",
-                       "AllowGameDVR", RegValue(0, DWORD))
 
     found = levels(judge(ctx))
     assert found["mouse_accel"] == DONE
@@ -1022,3 +1043,478 @@ def test_we_no_longer_tell_people_to_lower_texture_quality():
     text = guide_text()
     assert "텍스처 필터링 - 품질 고성능" not in text
     assert "기본값 그대로" in text
+
+
+# ============================================================================
+# 2.3 점검에서 찾은 것들 — 다시 생기지 않게
+# ============================================================================
+# --- 보안: 다른 웹사이트가 버튼을 대신 누르지 못하게 -----------------------
+def serve(tmp_path):
+    import threading
+    from optimizer import start_screen
+
+    screen = make(tmp_path)
+    server, url = start_screen(screen, port=18770, open_browser=False)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return screen, server, url
+
+
+def post(url, body: dict, headers=None):
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    request = urllib.request.Request(
+        url + "action", data=urllib.parse.urlencode(body, doseq=True).encode(),
+        headers=headers or {}, method="POST")
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None
+
+    try:
+        return urllib.request.build_opener(NoRedirect).open(request, timeout=5).status
+    except urllib.error.HTTPError as error:
+        return error.code
+
+
+def test_a_form_from_another_website_does_nothing(tmp_path):
+    """다른 사이트가 몰래 보낸 '한 번에 최적화' 는 표(token)가 없어서 막힌다."""
+    screen, server, url = serve(tmp_path)
+    try:
+        assert post(url, {"action": "apply_all"}) == 403
+        assert post(url, {"action": "apply_all", "token": "틀린표"}) == 403
+        assert post(url, {"action": "apply_all", "token": screen.token},
+                    {"Origin": "http://evil.example"}) == 403
+        assert latest_record(tmp_path) is None, "막힌 요청으로 바뀐 게 있으면 안 된다"
+
+        assert post(url, {"action": "apply_all", "token": screen.token}) == 303
+        assert latest_record(tmp_path) is not None
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_a_page_asked_for_under_another_name_is_refused(tmp_path):
+    """DNS 리바인딩 — IP 는 127.0.0.1 이어도 Host 가 남의 이름이면 화면을 안 준다."""
+    import http.client
+
+    screen, server, url = serve(tmp_path)
+    try:
+        port = server.server_address[1]
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        connection.request("GET", "/", headers={"Host": f"evil.example:{port}"})
+        assert connection.getresponse().status == 403
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        connection.request("GET", "/")
+        assert connection.getresponse().status == 200
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_every_form_on_the_page_carries_the_token(tmp_path):
+    screen = make(tmp_path, admin=False)
+    page = screen.render()
+    forms = page.count("<form")
+    assert forms >= 4
+    assert page.count(f'name="token" value="{screen.token}"') == forms
+
+
+def test_with_token_touches_only_form_tags():
+    page = _with_token('<form method="post" action="/action"><b>x</b></form>', "T")
+    assert page == ('<form method="post" action="/action">'
+                    '<input type="hidden" name="token" value="T"><b>x</b></form>')
+
+
+# --- 보안: 폴더 이름이 명령으로 실행되지 않게 --------------------------------
+@pytest.mark.parametrize("folder", [
+    r"C:\Games\$(Start-Process calc)",
+    r"C:\Games\It's mine",
+    "C:\\Games\\굽은\u2019따옴표",
+    r"C:\Games\`backtick",
+])
+def test_a_folder_name_is_passed_as_plain_text(folder):
+    script = f"Add-MpPreference -ExclusionPath {ps_literal(folder)}"
+    assert '"' not in script, "큰따옴표 안에서는 $( ) 가 실행된다"
+    assert ps_unquote(script) == folder
+
+
+def test_defender_exclusion_survives_a_strange_folder_name():
+    ctx = fake_context()
+    folder = PureWindowsPath(r"C:\Nexon\Sudden's $(Attack)")
+    ctx.install = Install(exe=folder / "SuddenAttack.exe", folder=folder, source="검사용")
+    tweak = find("defender")
+    record = tweak.action.apply(ctx)
+    assert ctx.shell.exclusions == [str(folder)]
+    tweak.action.revert(ctx, record)
+    assert ctx.shell.exclusions == []
+
+
+@pytest.mark.parametrize("folder, broad", [
+    ("C:\\", True),
+    ("D:", True),
+    (r"C:\Users", True),
+    (r"C:\Users\me", True),
+    (r"C:\Users\me\Downloads", True),
+    (r"C:\Users\me\Desktop", True),
+    (r"C:\Windows\System32", True),
+    (r"C:\Program Files (x86)", True),
+    (r"C:\Nexon\SuddenAttack", False),
+    (r"D:\SuddenAttack", False),
+    (r"C:\Users\me\Games\SuddenAttack", False),
+    (r"C:\Program Files (x86)\Nexon\SuddenAttack", False),
+])
+def test_broad_folders_are_never_excluded_from_the_antivirus(folder, broad):
+    env = {"USERPROFILE": r"C:\Users\me", "SystemRoot": r"C:\Windows"}
+    assert bool(too_broad(folder, env)) is broad
+
+
+def test_a_game_found_in_the_downloads_folder_is_not_excluded(monkeypatch):
+    monkeypatch.setenv("USERPROFILE", r"C:\Users\me")
+    ctx = fake_context()
+    folder = PureWindowsPath(r"C:\Users\me\Downloads")
+    ctx.install = Install(exe=folder / "SuddenAttack.exe", folder=folder, source="검사용")
+    status = {s.tweak.key: s for s in Optimizer(ctx).statuses()}["defender"]
+    assert "너무 넓은 곳" in status.blocked
+    with pytest.raises(RuntimeError):
+        find("defender").action.apply(ctx)
+    assert ctx.shell.exclusions == []
+
+
+def test_an_installer_is_not_mistaken_for_the_game(tmp_path):
+    folder = tmp_path / "Downloads"
+    folder.mkdir()
+    (folder / "SuddenAttack_Setup.exe").write_text("", encoding="utf-8")
+    assert find_game(registry=FakeRegistry(), roots=[], saved=str(folder)) is None
+
+
+def test_a_path_copied_with_quotes_still_works(tmp_path):
+    """탐색기의 '경로로 복사' 는 앞뒤에 큰따옴표를 붙인다."""
+    folder = make_install(tmp_path)
+    assert clean_path(f'  "{folder}"  ') == str(folder)
+    screen = make(tmp_path, install=False)
+    assert "찾았습니다" in screen.run("game_path", {"path": [f'"{folder}"']})
+
+
+# --- 호환성 탭에 걸어둔 것을 지우지 않는다 ------------------------------------
+LAYERS = r"Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers"
+EXE = r"C:\Nexon\SuddenAttack\SuddenAttack.exe"
+
+
+def test_compatibility_flags_the_user_set_are_kept():
+    ctx = fake_context()
+    ctx.registry.write("HKCU", LAYERS, EXE, RegValue("~ RUNASADMIN", STR))
+    tweak = find("fullscreen_opt")
+    assert tweak.action.state(ctx) == OFF
+
+    record = tweak.action.apply(ctx)
+    value = ctx.registry.read("HKCU", LAYERS, EXE).data
+    assert value == "~ RUNASADMIN DISABLEDXMAXIMIZEDWINDOWEDMODE HIGHDPIAWARE"
+    assert tweak.action.state(ctx) == ON
+
+    tweak.action.revert(ctx, record)
+    assert ctx.registry.read("HKCU", LAYERS, EXE).data == "~ RUNASADMIN"
+
+
+def test_a_dpi_choice_the_user_made_is_respected():
+    ctx = fake_context()
+    ctx.registry.write("HKCU", LAYERS, EXE, RegValue("~ DPIUNAWARE", STR))
+    find("fullscreen_opt").action.apply(ctx)
+    value = ctx.registry.read("HKCU", LAYERS, EXE).data
+    assert "DPIUNAWARE" in value and "HIGHDPIAWARE" not in value
+
+
+def test_flags_already_in_place_count_as_done_in_any_order():
+    ctx = fake_context()
+    ctx.registry.write("HKCU", LAYERS, EXE,
+                       RegValue("~ HIGHDPIAWARE RUNASADMIN DISABLEDXMAXIMIZEDWINDOWEDMODE", STR))
+    assert find("fullscreen_opt").action.state(ctx) == ON
+
+
+# --- 판정이 사실과 맞게 ---------------------------------------------------------
+def test_mouse_acceleration_turned_off_in_control_panel_counts_as_off():
+    """제어판에서 끄면 MouseSpeed 만 0 이 되고 6, 10 은 남는다. 그래도 꺼진 것이다."""
+    ctx = fake_context()
+    ctx.registry.write("HKCU", r"Control Panel\Mouse", "MouseSpeed", RegValue("0", STR))
+    assert find("mouse_accel").action.state(ctx) == ON
+    assert levels(judge(ctx))["mouse_accel"] == DONE
+
+
+def test_game_dvr_no_longer_touches_the_policy_key():
+    """정책 키를 쓰면 윈도우 설정에 '조직에서 관리합니다' 가 뜬다."""
+    tweak = find("game_dvr")
+    assert not tweak.admin
+    ctx = fake_context()
+    tweak.action.apply(ctx)
+    assert not ctx.registry.key_exists("HKLM", r"SOFTWARE\Policies\Microsoft\Windows\GameDVR")
+
+
+def test_game_dvr_promises_frames_only_when_recording_really_runs():
+    ctx = fake_context()
+    assert levels(judge(ctx))["game_dvr"] == SMALL
+    ctx.registry.write("HKCU", r"Software\Microsoft\Windows\CurrentVersion\GameDVR",
+                       "HistoricalCaptureEnabled", RegValue(1, DWORD))
+    assert levels(judge(ctx))["game_dvr"] == MID
+
+
+def test_dual_ccd_x3d_keeps_the_balanced_power_plan():
+    """라이젠 9 X3D 는 균형 조정 계획이어야 게임이 캐시 큰 코어로 간다."""
+    ctx = fake_context()
+    cpu = r"HARDWARE\DESCRIPTION\System\CentralProcessor\0"
+    ctx.registry.write("HKLM", cpu, "ProcessorNameString",
+                       RegValue("AMD Ryzen 9 7950X3D 16-Core Processor", STR))
+    optimizer = Optimizer(ctx)
+    assert "power_plan" not in optimizer.recommended_keys()
+    status = {s.tweak.key: s for s in optimizer.statuses()}["power_plan"]
+    assert "균형 조정" in status.blocked
+
+    ctx.registry.write("HKLM", cpu, "ProcessorNameString",
+                       RegValue("AMD Ryzen 7 9800X3D 8-Core Processor", STR))
+    assert "power_plan" in Optimizer(ctx).recommended_keys()
+
+
+def test_items_that_do_nothing_for_this_game_are_not_on_by_default():
+    for key in ("mmcss_games", "visual_effects"):
+        assert not find(key).recommended, key
+    assert find("nagle").impact == SMALL
+
+
+# --- 기록 ---------------------------------------------------------------------
+def test_two_applies_in_the_same_second_keep_both_records(tmp_path):
+    from datetime import datetime
+
+    when = datetime(2026, 9, 23, 12, 0, 0)
+    first = save_record({"a": {}}, root=tmp_path, when=when)
+    second = save_record({"b": {}}, root=tmp_path, when=when)
+    assert first != second and first.exists() and second.exists()
+    assert latest_record(tmp_path).keys == ["b"], "나중 것이 먼저 와야 한다"
+
+
+def test_nothing_changes_when_the_record_cannot_be_written(tmp_path, monkeypatch):
+    import optimizer as module
+
+    def refuse(root=None):
+        raise PermissionError("쓰기 금지")
+
+    monkeypatch.setattr(module, "check_writable", refuse)
+    ctx = fake_context()
+    before = snapshot(ctx.registry)
+    outcome = Optimizer(ctx, root=tmp_path).apply_recommended()
+    assert outcome.done == 0 and outcome.failed == 1
+    assert "아무것도 바꾸지 않았습니다" in outcome.steps[0].message
+    assert snapshot(ctx.registry) == before
+    assert ctx.display.monitors()[0].hz == 60
+
+
+def test_a_change_whose_record_fails_is_undone_on_the_spot(tmp_path, monkeypatch):
+    import optimizer as module
+
+    real = module.save_record
+    calls = {"n": 0}
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError("디스크 꽉 참")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(module, "save_record", flaky)
+    ctx = fake_context()
+    before = snapshot(ctx.registry)
+    optimizer = Optimizer(ctx, root=tmp_path)
+    outcome = optimizer.apply(["mouse_accel", "game_mode", "game_dvr"])
+    assert [step.ok for step in outcome.steps] == [True, False]
+    assert "원래대로 돌려놨습니다" in outcome.steps[1].message
+
+    optimizer.revert()
+    assert snapshot(ctx.registry) == before
+
+
+def test_undo_says_when_an_older_record_is_still_left(tmp_path):
+    screen = make(tmp_path)
+    screen.run("apply", {"key": ["mouse_accel"]})
+    screen.run("apply", {"key": ["game_mode"]})
+    assert "하나 더 있습니다" in screen.run("revert", {})
+    assert "하나 더 있습니다" not in screen.run("revert", {})
+
+
+def test_the_undo_box_uses_titles_not_internal_names(tmp_path):
+    screen = make(tmp_path)
+    screen.run("apply", {"key": ["mouse_accel"]})
+    page = screen.render()
+    assert "마우스 가속 끄기" in page.split("되돌리기</h3>")[1]
+    assert "mouse_accel</p>" not in page
+
+
+def test_a_crash_inside_a_button_becomes_a_message(tmp_path):
+    screen = make(tmp_path)
+
+    def boom(keys):
+        raise RuntimeError("일부러")
+
+    screen.optimizer.apply = boom
+    assert "문제가 생겼습니다" in screen.run("apply", {"key": ["mouse_accel"]})
+
+
+# --- 처음 실행하면 알아서 --------------------------------------------------------
+def test_first_run_applies_what_fits_this_computer(tmp_path):
+    screen = make(tmp_path)
+    assert auto_apply(screen)
+    assert screen.result.done >= 8
+    assert "처음 실행이라" in screen.notice
+    assert "원래대로 되돌리기" in screen.notice
+    assert screen.optimizer.ctx.display.monitors()[0].hz == 144
+
+
+def test_second_run_never_applies_by_itself(tmp_path):
+    """되돌리러 들어온 사람에게 다시 적용해버리면 안 된다."""
+    screen = make(tmp_path)
+    auto_apply(screen)
+    screen.optimizer.revert()
+    assert not auto_apply(make(tmp_path))
+    assert latest_record(tmp_path) is None
+
+
+def test_first_run_without_admin_waits_for_the_user(tmp_path):
+    assert not auto_apply(make(tmp_path, admin=False))
+    assert record_history(tmp_path) == []
+
+
+# --- 점검 -----------------------------------------------------------------------
+def module(speed, configured, kind=34, gb=16):
+    return {"Capacity": gb * 1024 ** 3, "Speed": speed, "ConfiguredClockSpeed": configured,
+            "SMBIOSMemoryType": kind}
+
+
+def test_memory_at_ddr5_default_speed_is_flagged():
+    check = memory_check([module(4800, 4800), module(4800, 4800)])
+    assert check.level == WARN
+    assert "EXPO" in check.line and "원래 4800 짜리 제품이면" in check.line
+    assert "DDR5 4800MT/s 2개 (총 32GB)" in check.line
+
+
+def test_memory_at_its_rated_speed_is_fine():
+    assert memory_check([module(5600, 5600), module(5600, 5600)]).level == GOOD
+
+
+def test_a_single_memory_stick_is_flagged():
+    check = memory_check(module(6000, 6000, gb=32))      # PowerShell 은 하나면 배열이 아니다
+    assert check.level == WARN and "싱글 채널" in check.line
+
+
+def test_old_windows_reporting_half_speed_is_read_right():
+    assert memory_check([module(3200, 1600, kind=26)] * 2).level == GOOD
+
+
+def test_laptop_memory_is_not_judged():
+    assert memory_check([module(4800, 4800)], laptop=True).level == GOOD
+
+
+def test_wifi_is_flagged_and_wired_is_fine():
+    assert network_check({"PhysicalMediaType": "Native 802.11",
+                          "LinkSpeed": "866.7 Mbps"}).level == WARN
+    assert network_check({"PhysicalMediaType": "802.3", "LinkSpeed": "1 Gbps"}).level == GOOD
+    slow = network_check({"PhysicalMediaType": "802.3", "LinkSpeed": "100 Mbps"})
+    assert slow.level == INFO and "핑에는 거의 영향이 없습니다" in slow.line
+    assert network_check(None) is None
+
+
+def test_hardware_json_from_powershell_is_read():
+    out = ('경고: 뭔가\n{"memory":[{"Capacity":17179869184,"Speed":4800,'
+           '"ConfiguredClockSpeed":5600,"SMBIOSMemoryType":34}],'
+           '"network":{"Name":"이더넷","PhysicalMediaType":"802.3","LinkSpeed":"1 Gbps"}}')
+    data = read_hardware(FakeShell(replies={"Win32_PhysicalMemory": Result(ok=True, out=out)}))
+    assert data["network"]["LinkSpeed"] == "1 Gbps"
+    assert read_hardware(FakeShell(default=Result(ok=True, out="망가진"))) == {}
+
+
+def test_running_overlays_are_named():
+    out = ('"Discord.exe","1","Console","1","150,000 K"\n'
+           '"NVIDIA Overlay.exe","2","Console","1","50,000 K"\n'
+           '"chrome.exe","3","Console","1","90,000 K"')
+    programs = running_programs(FakeShell(replies={"tasklist": Result(ok=True, out=out)}))
+    check = overlay_check(programs)
+    assert check.level == INFO
+    assert "Discord" in check.line and "NVIDIA 오버레이" in check.line
+    assert "게임 오버레이" in check.line
+    assert overlay_check({"chrome.exe"}) is None
+
+
+def test_a_laptop_on_battery_is_told_to_plug_in():
+    assert battery_check(Spec(laptop=True, on_battery=True)).level == WARN
+    assert battery_check(Spec(laptop=True, on_battery=False)) is None
+    assert battery_check(Spec(laptop=False, on_battery=True)) is None
+
+
+KOREAN_PING = """
+Ping 1.1.1.1 32바이트 데이터 사용:
+1.1.1.1의 응답: 바이트=32 시간=6ms TTL=57
+1.1.1.1의 응답: 바이트=32 시간<1ms TTL=57
+요청 시간이 만료되었습니다.
+192.168.0.1의 응답: 대상 호스트에 연결할 수 없습니다.
+1.1.1.1의 응답: 바이트=32 시간=41ms TTL=57
+
+1.1.1.1에 대한 Ping 통계:
+    패킷: 보냄 = 5, 받음 = 4, 손실 = 1 (20% 손실),
+왕복 시간(밀리초):
+    최소 = 1ms, 최대 = 41ms, 평균 = 16ms
+"""
+
+
+def test_ping_output_is_read_in_korean_and_english():
+    result = parse_ping(KOREAN_PING, 5)
+    assert result.times == [6.0, 1.0, 41.0]
+    assert result.lost == 2           # 시간 초과 + 연결할 수 없음
+    english = "Reply from 1.1.1.1: bytes=32 time=5ms TTL=57\n" * 10
+    assert parse_ping(english, 10).times == [5.0] * 10
+
+
+def test_ping_verdicts():
+    assert ping_check(parse_ping(KOREAN_PING, 5)).level == WARN
+    steady = parse_ping("Reply from 1.1.1.1: bytes=32 time=41ms TTL=57\n" * 10, 10)
+    assert ping_check(steady).level == GOOD
+    shaky = parse_ping("".join(f"응답: 바이트=32 시간={t}ms TTL=57\n"
+                               for t in (40, 41, 90, 40, 42, 41, 40, 41, 40, 41)), 10)
+    check = ping_check(shaky)
+    assert check.level == WARN and "흔들립니다" in check.line
+    assert "응답이 하나도 없습니다" in ping_check(parse_ping("", 10)).line
+
+
+def test_ping_button_measures_and_shows_it(tmp_path):
+    screen = make(tmp_path)
+    screen.optimizer.ctx.shell.run = lambda args, timeout=60: Result(
+        ok=True, out="Reply from 1.1.1.1: bytes=32 time=7ms TTL=57\n" * 10)
+    assert "핑을 쟀습니다" in screen.run("ping", {})
+    assert "손실 0/10" in screen.render()
+
+
+def test_the_checks_box_is_on_the_page(tmp_path):
+    page = make(tmp_path).render()
+    assert "점검 — 버튼으로는 못 고치는 것" in page
+    assert "핑 재기" in page
+
+
+def test_checks_are_skipped_off_windows():
+    ctx = fake_context(windows=False)
+    assert system_checks(ctx, spec_of(ctx)) == []
+
+
+# --- 안내문 -------------------------------------------------------------------
+def test_the_guide_matches_what_worked_on_a_real_gsync_setup():
+    text = guide_text()
+    assert "울트라" in text and "180Hz 면 171" in text
+    assert "슬로우모션" in text
+
+
+def test_the_guide_covers_keyboards_and_overlays():
+    text = guide_text()
+    assert "래피드 트리거" in text and "뒤돌기(F)" in text
+    assert "디바운스" in text and "씹힌" in text
+    assert "게임 내 오버레이 활성화" in text
+
+
+def test_the_guide_explains_more_vendor_tweaks_we_skip():
+    text = guide_text()
+    for word in ("메모리 무결성", "Spectre", "타이머 해상도", "TcpWindowSize"):
+        assert word in text, word
