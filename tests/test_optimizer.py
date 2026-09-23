@@ -982,3 +982,43 @@ def test_the_screen_admits_when_there_is_nothing_big_to_gain(tmp_path):
 
 def test_a_desktop_is_labelled_a_desktop_on_screen(tmp_path):
     assert "데스크톱" in make(tmp_path).render()
+
+
+# ============================================================================
+# [9] 안내문 — 조건을 빼먹으면 반대로 하게 된다
+# ============================================================================
+def guide_text(spec=None):
+    from optimizer import guide_sections
+
+    return "\n".join(
+        f"{section.title} {section.lead} " + " ".join(f"{what} {how}" for what, how in section.items)
+        for section in guide_sections(spec)
+    )
+
+
+def test_vsync_advice_states_both_cases():
+    """'수직 동기 끄기' 만 적으면 G-SYNC 쓰는 사람은 반대로 하게 된다."""
+    text = guide_text()
+    assert "G-SYNC 를 쓰면 '켜기', 안 쓰면 '끄기'" in text
+    assert "G-SYNC 없이 켜면" in text          # 왜 끄라고 하는지도 같이
+    assert "게임 안 수직 동기는 끄세요" in text   # 게임 안쪽은 언제나 끔
+
+
+def test_the_in_game_vsync_line_points_at_the_driver_one():
+    """게임 안과 드라이버는 반대다. 한쪽만 읽고 헷갈리면 안 된다."""
+    assert "드라이버 쪽 수직 동기는 얘기가 다릅니다" in guide_text()
+
+
+def test_turning_on_gsync_is_explained():
+    """이 프로그램이 못 바꾸는 것 중 화면에 제일 크게 걸리는 항목이다."""
+    text = guide_text()
+    assert "G-SYNC · 프리싱크 켜기" in text
+    assert "모니터 메뉴에는 'G-SYNC' 라는 말이 안 나옵니다" in text   # 여기서 대부분 막힌다
+    assert "Adaptive-Sync" in text
+
+
+def test_we_no_longer_tell_people_to_lower_texture_quality():
+    """그래픽카드가 놀고 있는 게임이다. 화질만 깎는 조언이었다."""
+    text = guide_text()
+    assert "텍스처 필터링 - 품질 고성능" not in text
+    assert "기본값 그대로" in text
