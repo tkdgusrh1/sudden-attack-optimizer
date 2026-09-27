@@ -75,7 +75,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 # 화면 아래에 표시된다. 무엇이 돌고 있는지 바로 확인할 수 있게 올려둔다.
-__version__ = "2.4.0"
+__version__ = "2.4.1"
 
 log = logging.getLogger("서든어택최적화")
 
@@ -3241,9 +3241,14 @@ def measure_game(ctx, process: str | None = None, seconds: int | None = None,
     if not ctx.admin:
         return GameResult(error="관리자 권한이 있어야 잴 수 있습니다 (윈도우 화면 기록을 읽습니다).")
     process = process or (ctx.install.exe_name if ctx.install else "SuddenAttack.exe")
-    if process.lower() not in running_programs(ctx.shell):
-        return GameResult(error=f"{process} 가 켜져 있지 않습니다. 게임을 켜고 맵에 들어간 뒤 "
-                                "누르세요.")
+    running = running_programs(ctx.shell)
+    if process.lower() not in running:
+        # 찾아둔 실행 파일과 실제로 도는 게임 이름이 다를 수 있다 (런처가 따로 띄우는 경우)
+        guess = sorted(name for name in running if name.startswith("sudden"))
+        if not guess:
+            return GameResult(error=f"{process} 가 켜져 있지 않습니다. 게임을 켜고 맵에 들어간 뒤 "
+                                    "누르세요.")
+        process = guess[0]
 
     handle, name = tempfile.mkstemp(prefix="sa-frames-", suffix=".csv")
     os.close(handle)
@@ -3266,8 +3271,12 @@ def measure_game(ctx, process: str | None = None, seconds: int | None = None,
     if beep:
         _beep(2)
     if not text.strip():
-        detail = (result.err or result.out or "").strip()[:200]
-        return GameResult(error=f"프레임 기록이 나오지 않았습니다. {detail}".strip())
+        if not result.ok:
+            detail = (result.err or result.out or "").strip()[:200]
+            return GameResult(error=f"측정 도구가 멈췄습니다: {detail}")
+        return GameResult(error="게임 장면이 하나도 잡히지 않았습니다. 게임 화면이 떠 있고 맵 안에서 "
+                                "움직이는 동안 재야 합니다 — 버튼을 누른 뒤 10초 안에 게임으로 "
+                                "돌아가세요.")
     return parse_presentmon(text, process)
 
 

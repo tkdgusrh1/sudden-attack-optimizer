@@ -1757,3 +1757,39 @@ def test_the_page_says_where_game_measurement_lives(tmp_path):
     assert "진짜 전체 화면" in page and "창처럼" in page
     for key, *_ in GAME_METRICS:
         assert key
+
+
+def test_game_measurement_finds_the_game_under_a_different_name(tmp_path, monkeypatch):
+    """찾아둔 exe 와 실제로 도는 게임 이름이 달라도 서든어택이면 잰다."""
+    monkeypatch.setattr(_module, "presentmon_path", lambda: tmp_path / "PresentMon.exe")
+    seen = []
+
+    class Windows(FakeWindows):
+        def run(self, args, timeout=60):
+            if args[0] == "tasklist":
+                return Result(ok=True, out='"SuddenAttack_x64.exe","1","Console","1","1 K"')
+            if args[0].endswith("PresentMon.exe"):
+                seen.append(args[args.index("--process_name") + 1])
+                Path(args[args.index("--output_file") + 1]).write_text(
+                    v2_csv([4.0] * 50, app="SuddenAttack_x64.exe"), encoding="utf-8")
+                return Result(ok=True)
+            return super().run(args, timeout)
+
+    game = measure_game(fake_context(shell=Windows()), beep=False)
+    assert seen == ["suddenattack_x64.exe"] and game.error == ""
+
+
+def test_no_frames_is_explained_in_words_not_tool_output(tmp_path, monkeypatch):
+    monkeypatch.setattr(_module, "presentmon_path", lambda: tmp_path / "PresentMon.exe")
+
+    class Windows(FakeWindows):
+        def run(self, args, timeout=60):
+            if args[0] == "tasklist":
+                return Result(ok=True, out='"SuddenAttack.exe","1","Console","1","1 K"')
+            if args[0].endswith("PresentMon.exe"):
+                return Result(ok=True, out="Started recording.\nStopped recording.")
+            return super().run(args, timeout)
+
+    error = measure_game(fake_context(shell=Windows()), beep=False).error
+    assert "게임 장면이 하나도 잡히지 않았습니다" in error
+    assert "Started recording" not in error
