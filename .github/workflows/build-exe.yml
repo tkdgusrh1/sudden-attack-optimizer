@@ -17,7 +17,7 @@ permissions:
 env:
   # 게임 프레임 측정 도구 — 인텔 PresentMon (MIT). 버전과 파일 지문을 고정해서 받는다.
   PM_VERSION: v2.6.0
-  PM_SHA256: ""
+  PM_SHA256: "B2A706BC6AD475749E3B7E3409263AA1E6906D45BDCF993F6DBC0F660188F1AF"
 
 jobs:
   exe:

@@ -125,6 +125,9 @@ def open_and_look(key: str) -> list:
 
 
 def main() -> int:
+    # GitHub 윈도우 컴퓨터는 영어판이라 콘솔이 한글을 못 찍는다
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(encoding="utf-8", errors="replace")
     OUT.mkdir(exist_ok=True)
     note("=== 0. 준비 — 가짜 서든어택 (실행 파일 위치만 있으면 된다) ===")
     game = Path(r"C:\Nexon\SuddenAttack")
