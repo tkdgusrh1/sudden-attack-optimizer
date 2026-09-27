@@ -1,18 +1,23 @@
 name: 실행 파일 (exe)
 
-# 파이썬이 없는 컴퓨터에 나눠줄 exe 를 만든다.
-#  - main 에 optimizer.py 가 바뀌어 올라오면: exe 를 만들어 Releases 에 올린다.
-#    태그(v2.3.0 처럼)는 optimizer.py 의 __version__ 을 읽어 여기서 직접 만든다.
-#    같은 버전으로 다시 올라오면 그 릴리스의 exe 를 새것으로 바꾼다.
+# 파이썬이 없는 컴퓨터에 나눠줄 exe 를 만들고, 진짜 윈도우에서 처음부터 끝까지 검사한다.
+#  - main 에 optimizer.py 가 바뀌어 올라오면: 검사를 통과한 exe 만 Releases 에 올린다.
+#    태그(v2.4.0 처럼)는 optimizer.py 의 __version__ 을 읽어 여기서 직접 만든다.
 #  - Actions 탭에서 손으로 돌려도 똑같이 한다.
 on:
   push:
     branches: [main]
-    paths: ["optimizer.py", ".github/workflows/build-exe.yml", ".github/release-notes.md"]
+    paths: ["optimizer.py", "tests/**", "third_party/**", ".github/workflows/build-exe.yml",
+            ".github/release-notes.md"]
   workflow_dispatch:
 
 permissions:
   contents: write
+
+env:
+  # 게임 프레임 측정 도구 — 인텔 PresentMon (MIT). 버전과 파일 지문을 고정해서 받는다.
+  PM_VERSION: v2.6.0
+  PM_SHA256: ""
 
 jobs:
   exe:
@@ -22,7 +27,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install pytest "pyinstaller>=6,<7"
+      - run: pip install pytest pillow "pyinstaller>=6,<7"
       - run: python -m pytest -q
 
       - name: 버전 읽기
@@ -30,12 +35,25 @@ jobs:
         shell: bash
         run: echo "tag=v$(python -c 'import optimizer; print(optimizer.__version__)')" >> "$GITHUB_OUTPUT"
 
-      - name: exe 만들기
-        run: pyinstaller --onefile --console --clean --name SuddenAttack-Optimizer optimizer.py
+      - name: PresentMon 받기
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download $env:PM_VERSION -R GameTechDev/PresentMon -p "PresentMon-*-x64.exe" -O PresentMon.exe
+          $hash = (Get-FileHash PresentMon.exe -Algorithm SHA256).Hash
+          Write-Host "PresentMon $env:PM_VERSION sha256 = $hash  크기 = $((Get-Item PresentMon.exe).Length)"
+          if ($env:PM_SHA256 -and $hash -ne $env:PM_SHA256) { throw "PresentMon 파일 지문이 다릅니다 — 받지 않습니다" }
 
-      # 만든 exe 가 진짜 윈도우에서 도는지 — 버전, 상태 출력(레지스트리·powercfg·점검),
-      # 화면(웹 서버)까지 실제로 띄워본다. 여기서 실패하면 올리지 않는다.
-      - name: 만든 exe 확인
+      - name: exe 만들기 (PresentMon 을 안에 넣어서 파일 하나로)
+        run: >
+          pyinstaller --onefile --console --clean --name SuddenAttack-Optimizer
+          --add-binary "PresentMon.exe;."
+          --add-data "third_party/PresentMon-LICENSE.txt;."
+          optimizer.py
+
+      # 만든 exe 가 뜨는지 — 버전, 상태 출력, 화면(웹 서버)과 작은 확인 창까지.
+      - name: 만든 exe 가 뜨는지
         shell: pwsh
         run: |
           $exe = "dist\SuddenAttack-Optimizer.exe"
@@ -45,15 +63,27 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "status 실패" }
           $p = Start-Process $exe -ArgumentList "screen","--no-browser","--no-auto","--port","8790" -PassThru
           $ok = $false
-          foreach ($i in 1..30) {
+          foreach ($i in 1..40) {
             Start-Sleep -Seconds 1
             try {
-              $r = Invoke-WebRequest "http://127.0.0.1:8790/" -UseBasicParsing
-              if ($r.StatusCode -eq 200 -and $r.Content -match 'name="token"') { $ok = $true; break }
+              $main = Invoke-WebRequest "http://127.0.0.1:8790/" -UseBasicParsing
+              $check = Invoke-WebRequest "http://127.0.0.1:8790/check" -UseBasicParsing
+              if ($main.StatusCode -eq 200 -and $main.Content -match 'name="token"' -and
+                  $check.StatusCode -eq 200 -and $check.Content -match 'k-row') { $ok = $true; break }
             } catch { }
           }
           Get-Process -Name "SuddenAttack-Optimizer" -ErrorAction SilentlyContinue | Stop-Process -Force
           if (-not $ok) { throw "화면이 뜨지 않음" }
+
+      # 진짜 윈도우에서: 적용 → reg · powercfg 로 하나하나 확인 → 확인 창 → 게임 측정 → 되돌리기
+      - name: 전체 검사 (적용 · 확인 · 되돌리기)
+        run: python tests/windows_e2e.py dist\SuddenAttack-Optimizer.exe
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-report
+          path: e2e/
 
       - uses: actions/upload-artifact@v4
         with:

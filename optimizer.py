@@ -16,6 +16,10 @@
         python optimizer.py status     지금 상태만 출력
         python optimizer.py apply      권장 항목 바로 적용
         python optimizer.py revert     마지막 최적화 되돌리기
+        python optimizer.py check      적용됐는지 윈도우에서 읽은 값으로 확인
+        python optimizer.py show KEY   그 설정이 보이는 윈도우 창 열기
+        python optimizer.py measure    컴퓨터 성능 재기 (적용 전·후 비교)
+        python optimizer.py game       게임 프레임 재기 (서든어택을 켠 상태에서)
 
 파일 안 지도 — 고칠 일이 있으면 [7] 만 보시면 됩니다
     [1]  레지스트리     윈도우 설정값을 읽고 쓴다
@@ -26,9 +30,11 @@
     [6]  되돌리기 기록  바꾸기 전 값을 파일로 남긴다
     [7]  최적화 항목    ← 항목을 더하고 빼는 곳
     [8]  실행기         적용하고, 기록하고, 되돌린다
-    [9]  안내문         자동으로 못 바꾸는 것들
-    [10] 화면           브라우저에 뜨는 페이지
-    [11] 시작 지점      더블클릭과 명령줄
+    [9]  확인           적용됐는지 윈도우 창으로 직접 본다
+    [10] 측정           정말 좋아졌는지 숫자로 (컴퓨터 · 게임 프레임)
+    [11] 안내문         자동으로 못 바꾸는 것들
+    [12] 화면           브라우저에 뜨는 페이지
+    [13] 시작 지점      더블클릭과 명령줄
 
 지키는 것
     · 되돌릴 수 있는 것만 바꾼다. 바꾸기 전 값을 못 읽는 설정은 아예 안 넣었다.
@@ -58,6 +64,7 @@ import socket
 import string
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import webbrowser
@@ -68,7 +75,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 # 화면 아래에 표시된다. 무엇이 돌고 있는지 바로 확인할 수 있게 올려둔다.
-__version__ = "2.3.1"
+__version__ = "2.4.0"
 
 log = logging.getLogger("서든어택최적화")
 
@@ -1471,7 +1478,14 @@ IMPACT_LABEL = {BIG: "체감 큼", MID: "체감 보통", SMALL: "체감 작음"}
 
 # 고성능 전원 계획. 윈도우가 기본으로 갖고 있는 값이라 어느 PC에서나 같다.
 HIGH_PERFORMANCE = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
-PLAN_NAME = "서든어택 최적화"
+# 이름에 영어 표식을 같이 넣는다. 한국어가 아닌 윈도우는 powercfg 가 한글을 '?' 로 찍어서
+# 이름만으로는 우리 계획을 못 알아본다. 예전 이름(한글만)으로 만든 계획도 알아본다.
+PLAN_NAME = "서든어택 최적화 (SA-Optimizer)"
+OLD_PLAN_NAME = "서든어택 최적화"
+
+
+def _is_our_plan(name: str) -> bool:
+    return "sa-optimizer" in (name or "").lower() or OLD_PLAN_NAME in (name or "")
 
 _GUID = re.compile(r"[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}")
 
@@ -1729,14 +1743,14 @@ class PowerPlanAction(Action):
         active = self._active(ctx)
         if active is None:
             return UNKNOWN
-        return ON if PLAN_NAME in active[1] else OFF
+        return ON if _is_our_plan(active[1]) else OFF
 
     def apply(self, ctx) -> dict:
         active = self._active(ctx)
         if active is None:
             raise RuntimeError("지금 전원 계획을 읽지 못했습니다.")
         before, before_name = active
-        if PLAN_NAME in before_name:
+        if _is_our_plan(before_name):
             # 이미 우리 계획을 쓰고 있다. 또 만들지 말고 값만 다시 맞춘다.
             self._tune(ctx, before)
             return {"kind": "power", "before": None, "created": None, "retuned": before}
@@ -1773,7 +1787,7 @@ class PowerPlanAction(Action):
             return None
         for line in result.out.splitlines():
             parsed = _parse_scheme(line)
-            if parsed and PLAN_NAME in parsed[1]:
+            if parsed and _is_our_plan(parsed[1]):
                 return parsed[0]
         return None
 
@@ -2528,7 +2542,737 @@ def remember_game_path(value: str, root: Path | None = None) -> None:
 
 
 # ============================================================================
-# [9] 안내문 — 자동으로 못 바꾸는 것들
+# [9] 확인 — 적용됐는지 윈도우 창으로 직접 본다
+# ============================================================================
+#
+# "적용했습니다" 라는 이 프로그램의 말만 믿으라고 할 수는 없다. 그래서 항목마다
+#   ① 윈도우에서 지금 읽은 값을 사람 말로 보여주고 (작은 '적용 확인' 창)
+#   ② 그 설정이 실제로 보이는 윈도우 창을 바로 열어준다.
+# 열린 창은 화면 오른쪽 위로 옮기고 맨 앞에 띄운다. 제어판 대화상자는 원래 작아서
+# 자리만 옮기고, 설정 앱·레지스트리 편집기는 크기까지 줄인다.
+
+
+@dataclass(frozen=True)
+class View:
+    label: str              # 버튼 글자
+    look: str               # 열린 창에서 무엇을 보면 되나
+    target: str             # 무엇을 여나 — control:… / uri:… / exe:… / regedit / properties
+    window: str = "#32770"  # 열린 창의 종류 — 찾아서 옮길 때 쓴다 (#32770 = 대화상자)
+    titles: tuple = ()      # 열린 창 제목에 들어 있는 말 (한국어·영어)
+
+
+_SETTINGS_APP = ("ApplicationFrameWindow", ("설정", "Settings"))
+_REGEDIT = ("RegEdit_RegEdit", ("레지스트리 편집기", "Registry Editor"))
+_ONLY_LOOK = " 보기만 하고 고치지는 마세요."
+
+VIEWS = {
+    "mouse_accel": View(
+        "마우스 속성 열기",
+        "'포인터 옵션' 탭 → '포인터 정확도 향상' 체크가 풀려 있으면 적용된 것입니다.",
+        "control:main.cpl,,2", titles=("마우스 속성", "Mouse Properties")),
+    "refresh_rate": View(
+        "고급 디스플레이 열기",
+        "'새로 고침 빈도' 가 모니터 최대값(예: 180Hz)이면 적용된 것입니다.",
+        "uri:ms-settings:display-advanced", *_SETTINGS_APP),
+    "fullscreen_opt": View(
+        "서든어택 속성 열기",
+        "'호환성' 탭 → '전체 화면 최적화 사용 안 함' 이 체크돼 있으면 적용된 것입니다.",
+        "properties", titles=("속성", "Properties")),
+    "visual_effects": View(
+        "성능 옵션 열기",
+        "'시각 효과' 탭에서 창 애니메이션 같은 항목의 체크가 풀려 있으면 적용된 것입니다.",
+        "exe:SystemPropertiesPerformance.exe", titles=("성능 옵션", "Performance Options")),
+    "power_plan": View(
+        "고급 전원 설정 열기",
+        "맨 위 칸이 '서든어택 최적화 … [활성]' 이고 '프로세서 전원 관리 → 최소 프로세서 상태' "
+        "가 100% 면 적용된 것입니다.",
+        "control:powercfg.cpl,,3", titles=("전원 옵션", "Power Options")),
+    "nagle": View(
+        "레지스트리 편집기에서 보기",
+        "오른쪽 목록에 TcpAckFrequency 와 TCPNoDelay 가 1 이면 적용된 것입니다." + _ONLY_LOOK,
+        "regedit", *_REGEDIT),
+    "net_throttle": View(
+        "레지스트리 편집기에서 보기",
+        "오른쪽 목록에 NetworkThrottlingIndex 가 0xffffffff 면 적용된 것입니다." + _ONLY_LOOK,
+        "regedit", *_REGEDIT),
+    "mmcss_games": View(
+        "레지스트리 편집기에서 보기",
+        "SystemResponsiveness 가 10 이면 적용된 것입니다 (Tasks → Games 안의 값들도 같이 "
+        "바뀝니다)." + _ONLY_LOOK,
+        "regedit", *_REGEDIT),
+    "game_mode": View(
+        "게임 모드 설정 열기",
+        "'게임 모드' 가 켬이면 적용된 것입니다.",
+        "uri:ms-settings:gaming-gamemode", *_SETTINGS_APP),
+    "game_dvr": View(
+        "캡처 설정 열기",
+        "'지난 30초 녹화(백그라운드 녹화)' 가 꺼져 있으면 됩니다. 녹화 기능이 막혀 있다고 "
+        "나오면 그게 적용된 상태입니다.",
+        "uri:ms-settings:gaming-gamedvr", *_SETTINGS_APP),
+    "notifications": View(
+        "알림 설정 열기",
+        "맨 위 '알림' 이 끔이면 적용된 것입니다.",
+        "uri:ms-settings:notifications", *_SETTINGS_APP),
+    "hags_off": View(
+        "그래픽 설정 열기",
+        "'기본 그래픽 설정 변경' → '하드웨어 가속 GPU 예약' 이 끔이면 적용된 것입니다. "
+        "재부팅한 뒤에 바뀝니다.",
+        "uri:ms-settings:display-advancedgraphics", *_SETTINGS_APP),
+    "priority": View(
+        "레지스트리 편집기에서 보기",
+        "오른쪽 목록에 CpuPriorityClass 가 3(높음)이면 적용된 것입니다. 게임을 켠 뒤 작업 "
+        "관리자 → 세부 정보에서 SuddenAttack.exe 의 우선 순위가 '높음' 으로도 보입니다." + _ONLY_LOOK,
+        "regedit", *_REGEDIT),
+    "defender": View(
+        "바이러스 방지 설정 열기",
+        "'제외 추가 또는 제거' 를 누르면 목록에 서든어택 폴더가 있어야 합니다.",
+        "uri:windowsdefender://threatsettings", "ApplicationFrameWindow",
+        ("Windows 보안", "Windows Security")),
+}
+
+# 호환성 탭의 체크 이름 — 레지스트리에는 영어 약어로 들어 있다
+LAYER_WORDS = {
+    "DISABLEDXMAXIMIZEDWINDOWEDMODE": "전체 화면 최적화 사용 안 함",
+    "HIGHDPIAWARE": "높은 DPI 재정의(응용 프로그램)",
+    "DPIUNAWARE": "높은 DPI 재정의(시스템)",
+    "GDIDPISCALING": "높은 DPI 재정의(시스템-고급)",
+    "RUNASADMIN": "관리자 권한으로 실행",
+}
+
+SMALL_WINDOW = (560, 620)       # 설정 앱·레지스트리 편집기를 줄일 크기
+
+
+def live_line(tweak: Tweak, ctx) -> str:
+    """이 항목이 지금 윈도우에 어떻게 돼 있는지, 방금 읽은 값으로 한 줄."""
+    try:
+        special = _LIVE.get(tweak.key)
+        return special(tweak, ctx) if special else _live_registry(tweak, ctx)
+    except Exception as exc:
+        log.debug("%s 값을 읽지 못했습니다: %s", tweak.key, exc)
+        return f"읽지 못했습니다 ({exc})"
+
+
+def _shown(value) -> str:
+    if value is None:
+        return "(없음)"
+    data = value.data
+    if isinstance(data, int) and data > 0xFFFF:
+        return hex(data)
+    return str(data)
+
+
+def _live_registry(tweak, ctx) -> str:
+    items = tweak.action.items(ctx) if isinstance(tweak.action, RegistryAction) else []
+    if not items:
+        return "이 컴퓨터에는 해당하는 값이 없습니다."
+    return " · ".join(f"{item.name} = {_shown(ctx.registry.read(item.root, item.path, item.name))}"
+                      for item in items[:5])
+
+
+def _read_value(ctx, root, path, name):
+    return ctx.registry.read(root, path, name)
+
+
+def _live_mouse(tweak, ctx) -> str:
+    speed = _read_value(ctx, "HKCU", r"Control Panel\Mouse", "MouseSpeed")
+    off = speed is not None and _same(speed.data, "0")
+    return f"포인터 정확도 향상(가속): {'꺼짐' if off else '켜짐'} (MouseSpeed = {_shown(speed)})"
+
+
+def _live_refresh(tweak, ctx) -> str:
+    screens = ctx.display.monitors()
+    if not screens:
+        return "모니터를 읽지 못했습니다."
+    return " · ".join(f"모니터 {number}: {screen.hz}Hz (이 해상도 최대 {screen.best_hz}Hz)"
+                      for number, screen in enumerate(screens, 1))
+
+
+def _live_layers(tweak, ctx) -> str:
+    if not ctx.install:
+        return "서든어택을 못 찾았습니다."
+    flags = tweak.action._flags(ctx)
+    if not flags:
+        return f"{ctx.install.exe_name} 호환성 설정: 아무것도 없음"
+    words = ", ".join(LAYER_WORDS.get(flag.upper(), flag) for flag in flags)
+    return f"{ctx.install.exe_name} 호환성 설정: {words}"
+
+
+def _live_power(tweak, ctx) -> str:
+    active = tweak.action._active(ctx)
+    if active is None:
+        return "지금 전원 계획을 읽지 못했습니다."
+    guid, name = active
+    line = f"켜진 전원 계획: {name or guid}"
+    if _is_our_plan(name):
+        minimum = processor_minimum(ctx)
+        if minimum is not None:
+            line += f" · 최소 프로세서 상태(전원 연결 시) {minimum}%"
+    return line
+
+
+def processor_minimum(ctx) -> int | None:
+    """켜진 전원 계획의 '최소 프로세서 상태' (전원 연결 시, %)."""
+    result = ctx.shell.run(["powercfg", "/query", "SCHEME_CURRENT", "SUB_PROCESSOR",
+                            "PROCTHROTTLEMIN"])
+    if not result.ok:
+        return None
+    # 범위(최소·최대·증분) 다음에 AC, DC 순서로 나온다. 글자는 언어마다 달라서 숫자만 본다.
+    numbers = re.findall(r"0x([0-9a-fA-F]{8})", result.out or "")
+    return int(numbers[-2], 16) if len(numbers) >= 2 else None
+
+
+def _live_nagle(tweak, ctx) -> str:
+    cards = sorted({item.path for item in tweak.action.items(ctx)})
+    if not cards:
+        return "IP 가 잡힌 랜카드가 없습니다."
+    done = 0
+    for path in cards:
+        values = [ctx.registry.read("HKLM", path, name) for name in ("TcpAckFrequency", "TCPNoDelay")]
+        if all(value is not None and _same(value.data, 1) for value in values):
+            done += 1
+    return (f"IP 가 잡힌 랜카드 {len(cards)}개 중 {done}개에 적용됨 "
+            "(TcpAckFrequency = 1, TCPNoDelay = 1)")
+
+
+def _live_throttle(tweak, ctx) -> str:
+    item = tweak.action.items(ctx)[0]
+    value = ctx.registry.read(item.root, item.path, item.name)
+    if value is None:
+        return "NetworkThrottlingIndex = (없음) — 윈도우 기본값 (초당 패킷 제한 있음)"
+    unlimited = _same(value.data, 0xFFFFFFFF)
+    return f"NetworkThrottlingIndex = {_shown(value)}{' — 제한 없음' if unlimited else ''}"
+
+
+def _live_game_mode(tweak, ctx) -> str:
+    value = _read_value(ctx, "HKCU", r"Software\Microsoft\GameBar", "AutoGameModeEnabled")
+    if value is None:
+        return "게임 모드: 켬 (값이 없으면 윈도우 기본값이 켬입니다)"
+    return f"게임 모드: {'켬' if _same(value.data, 1) else '끔'} (AutoGameModeEnabled = {_shown(value)})"
+
+
+def _live_dvr(tweak, ctx) -> str:
+    enabled = _read_value(ctx, "HKCU", r"System\GameConfigStore", "GameDVR_Enabled")
+    capture = _read_value(ctx, "HKCU", RECORDING_KEY, "AppCaptureEnabled")
+    history = _read_value(ctx, "HKCU", RECORDING_KEY, "HistoricalCaptureEnabled")
+
+    def on(value):
+        return value is None or not _same(value.data, 0)
+
+    running = history is not None and _same(history.data, 1)
+    return (f"게임 녹화 기능: {'켜짐' if on(enabled) or on(capture) else '꺼짐'} · "
+            f"지난 30초 녹화: {'켜짐' if running else '꺼짐'}")
+
+
+def _live_toast(tweak, ctx) -> str:
+    item = tweak.action.items(ctx)[0]
+    value = ctx.registry.read(item.root, item.path, item.name)
+    off = value is not None and _same(value.data, 0)
+    return f"알림 팝업: {'끔' if off else '켬'} (ToastEnabled = {_shown(value)})"
+
+
+def _live_hags(tweak, ctx) -> str:
+    item = tweak.action.items(ctx)[0]
+    value = ctx.registry.read(item.root, item.path, item.name)
+    words = {"1": "끔", "2": "켬"}
+    state = words.get(str(value.data), "알 수 없음") if value is not None else "값 없음 (기본값)"
+    return f"하드웨어 가속 GPU 예약: {state} (HwSchMode = {_shown(value)}) — 바꾼 값은 재부팅 뒤에 먹습니다"
+
+
+def _live_priority(tweak, ctx) -> str:
+    items = tweak.action.items(ctx)
+    if not items:
+        return "서든어택을 못 찾았습니다."
+    value = ctx.registry.read(items[0].root, items[0].path, items[0].name)
+    words = {"3": "높음", "6": "보통 초과", "2": "보통"}
+    state = words.get(str(value.data), str(value.data)) if value is not None else "보통 (따로 정한 값 없음)"
+    return f"{ctx.install.exe_name} 시작 우선순위: {state} (CpuPriorityClass = {_shown(value)})"
+
+
+def _live_defender(tweak, ctx) -> str:
+    state = tweak.action.state(ctx)
+    return {
+        ON: "검사 제외 목록에 서든어택 폴더가 있습니다",
+        OFF: "검사 제외 목록에 서든어택 폴더가 없습니다",
+        NA: "서든어택을 못 찾았습니다",
+    }.get(state, "제외 목록은 관리자 권한으로만 볼 수 있습니다")
+
+
+_LIVE = {
+    "mouse_accel": _live_mouse,
+    "refresh_rate": _live_refresh,
+    "fullscreen_opt": _live_layers,
+    "power_plan": _live_power,
+    "nagle": _live_nagle,
+    "net_throttle": _live_throttle,
+    "game_mode": _live_game_mode,
+    "game_dvr": _live_dvr,
+    "notifications": _live_toast,
+    "hags_off": _live_hags,
+    "priority": _live_priority,
+    "defender": _live_defender,
+}
+
+
+# --- 윈도우 창 열기 -------------------------------------------------------
+def open_view(key: str, ctx) -> str:
+    """이 항목이 보이는 윈도우 창을 열고, 무엇을 보면 되는지 말해준다."""
+    view = VIEWS.get(key)
+    tweak = by_key().get(key)
+    if view is None or tweak is None:
+        return "이 항목은 열어볼 창이 없습니다."
+    if not ctx.windows:
+        return "윈도우에서만 열 수 있습니다."
+    kind, _, target = view.target.partition(":")
+    try:                                        # pragma: no cover - 윈도우 전용
+        before = {window[0] for window in top_windows()}
+        if kind == "control":
+            subprocess.Popen(["control.exe", target])
+        elif kind == "exe":
+            subprocess.Popen([target])
+        elif kind == "uri":
+            os.startfile(target)
+        elif kind == "regedit":
+            items = tweak.action.items(ctx)
+            if not items:
+                return "이 컴퓨터에는 해당하는 값이 없어서 열 곳이 없습니다."
+            _regedit_at(ctx.registry, items[0].root, items[0].path)
+        elif kind == "properties":
+            if not ctx.install:
+                return "서든어택을 못 찾아서 열 수 없습니다."
+            if not _file_properties(str(ctx.install.exe)):
+                subprocess.Popen(f'explorer.exe /select,"{ctx.install.exe}"')
+                return ("속성 창을 바로 못 열어서 탐색기로 파일을 보여드렸습니다. 파일을 우클릭 → "
+                        "속성 → '호환성' 탭을 보세요.")
+        place_window(view, before)
+    except Exception as exc:                    # pragma: no cover - 윈도우 전용
+        log.warning("%s 창을 열지 못했습니다: %s", key, exc)
+        return f"창을 열지 못했습니다: {exc}"
+    return f"창을 열었습니다 (화면 오른쪽 위). {view.look}"
+
+
+def _korean_ui() -> bool:
+    if not WINDOWS:
+        return False
+    try:                                        # pragma: no cover - 윈도우 전용
+        return ctypes.windll.kernel32.GetUserDefaultUILanguage() & 0x3FF == 0x12
+    except Exception:                           # pragma: no cover - 윈도우 전용
+        return False
+
+
+def _regedit_at(registry, root: str, path: str) -> None:  # pragma: no cover - 윈도우 전용
+    """레지스트리 편집기를 그 키가 펼쳐진 채로 연다.
+
+    편집기는 마지막으로 보던 곳(LastKey)을 기억했다가 거기서 열린다. 그 값을 우리가
+    보여줄 곳으로 바꿔두고 새 창(-m)으로 띄운다. LastKey 는 편집기 자신이 쓰는 화면
+    위치 기억일 뿐이라 되돌리기 기록에는 넣지 않는다.
+    """
+    applet = r"Software\Microsoft\Windows\CurrentVersion\Applets\Regedit"
+    full = {"HKLM": "HKEY_LOCAL_MACHINE", "HKCU": "HKEY_CURRENT_USER"}[root] + "\\" + path
+    prefix = "컴퓨터" if _korean_ui() else "Computer"
+    last = registry.read("HKCU", applet, "LastKey")
+    if last is not None and isinstance(last.data, str) and "\\HKEY_" in "\\" + last.data:
+        prefix = ("\\" + last.data).split("\\HKEY_", 1)[0].lstrip("\\")
+    registry.write("HKCU", applet, "LastKey", RegValue(f"{prefix}\\{full}" if prefix else full, STR))
+    subprocess.Popen(["regedit.exe", "-m"])
+
+
+def _file_properties(path: str) -> bool:        # pragma: no cover - 윈도우 전용
+    """파일 '속성' 창을 호환성 탭이 펼쳐진 채로 연다. 창은 이 프로그램 안에서 뜬다."""
+    from ctypes import wintypes
+
+    ctypes.windll.ole32.CoInitializeEx(None, 0x2)
+    show = ctypes.windll.shell32.SHObjectProperties
+    show.argtypes = [wintypes.HWND, wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR]
+    show.restype = wintypes.BOOL
+    return bool(show(None, 0x2, path, "호환성" if _korean_ui() else "Compatibility"))
+
+
+def _user32():                                  # pragma: no cover - 윈도우 전용
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                    ctypes.c_int, ctypes.c_int, wintypes.UINT]
+    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    user32.BringWindowToTop.argtypes = [wintypes.HWND]
+    user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    return user32
+
+
+def top_windows() -> list:
+    """화면에 보이는 최상위 창들 — (핸들, 종류, 제목, (왼쪽, 위, 오른쪽, 아래))."""
+    if not WINDOWS:
+        return []
+    from ctypes import wintypes                 # pragma: no cover - 윈도우 전용
+
+    user32 = _user32()
+    found = []
+    callback = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def visit(hwnd, _):
+        if user32.IsWindowVisible(hwnd):
+            kind = ctypes.create_unicode_buffer(256)
+            user32.GetClassNameW(hwnd, kind, 256)
+            title = ctypes.create_unicode_buffer(512)
+            user32.GetWindowTextW(hwnd, title, 512)
+            rect = wintypes.RECT()
+            user32.GetWindowRect(hwnd, ctypes.byref(rect))
+            found.append((hwnd, kind.value, title.value,
+                          (rect.left, rect.top, rect.right, rect.bottom)))
+        return True
+
+    user32.EnumWindows(callback(visit), 0)
+    return found
+
+
+def _matching(view: View) -> list:
+    return [window for window in top_windows()
+            if window[1] == view.window and any(word in window[2] for word in view.titles)]
+
+
+def place_window(view: View, before: set, wait: float = 6.0):  # pragma: no cover - 윈도우 전용
+    """방금 연 창을 찾아 화면 오른쪽 위 맨 앞에 둔다. 큰 창은 작게 줄인다.
+
+    이 프로그램은 브라우저 뒤에서 돈다. 그냥 두면 새 창이 브라우저 뒤에 숨어서
+    "아무것도 안 떴다" 가 된다. 그래서 찾아서 앞으로 꺼내준다.
+    """
+    user32 = _user32()
+    chosen = None
+    deadline = time.monotonic() + wait
+    while chosen is None and time.monotonic() < deadline:
+        time.sleep(0.25)
+        fresh = [window for window in _matching(view) if window[0] not in before]
+        chosen = fresh[0] if fresh else None
+    if chosen is None:
+        # 설정 앱처럼 이미 열려 있던 창을 다시 쓰는 경우 — 새 창이 생기지 않는다
+        existing = _matching(view)
+        chosen = existing[0] if existing else None
+    if chosen is None:
+        return None
+    hwnd, kind, _, (left, top, right, bottom) = chosen
+    width, height = right - left, bottom - top
+    if kind != "#32770":                    # 대화상자는 원래 작다. 나머지만 줄인다
+        user32.ShowWindow(hwnd, 9)          # 최대화돼 있으면 풀기
+        width, height = SMALL_WINDOW
+    x = max(user32.GetSystemMetrics(0) - width - 24, 0)
+    user32.SetWindowPos(hwnd, -1, x, 48, width, height, 0x0040)             # 맨 위로
+    user32.SetWindowPos(hwnd, -2, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040)     # 다른 창을 가리진 않게
+    mine = ctypes.windll.kernel32.GetCurrentThreadId()
+    theirs = user32.GetWindowThreadProcessId(user32.GetForegroundWindow(), None)
+    if theirs and theirs != mine:
+        user32.AttachThreadInput(mine, theirs, True)
+    user32.SetForegroundWindow(hwnd)
+    user32.BringWindowToTop(hwnd)
+    if theirs and theirs != mine:
+        user32.AttachThreadInput(mine, theirs, False)
+    return hwnd
+
+
+# ============================================================================
+# [10] 측정 — 정말 좋아졌는지 숫자로
+# ============================================================================
+#
+# "빨라진 것 같다" 는 느낌은 믿을 게 못 된다. 그래서 바꾸기 전과 후를 같은 방법으로 잰다.
+#
+#   · 컴퓨터 측정 (3초) — 이 프로그램이 바꾸는 것 중 숫자로 잴 수 있는 것
+#       화면에 뜨기까지 기다리는 시간 (주사율)
+#       쉬었다가 다시 일을 시작할 때 CPU 가 늦게 출발하는 정도 (전원 계획)
+#       1ms 만 기다리라고 했을 때 실제로 늦는 정도
+#   · 게임 측정 (30초) — 서든어택이 켜져 있을 때 실제 프레임을 잰다.
+#       인텔이 만든 PresentMon(MIT 라이선스)을 exe 안에 넣어뒀다. 윈도우가 남기는 화면
+#       기록(ETW)만 읽고 게임에는 손대지 않는다. FrameView 같은 측정 도구도 이걸 쓴다.
+#
+# 기록마다 '그때 최적화가 적용돼 있었나' 를 같이 적어서, 적용 전 · 후를 나란히 보여준다.
+# 차이가 흔들림 폭 안이면 "차이 없음" 이라고 말한다 — 없는 효과를 만들어내지 않는다.
+
+MEASURE_FILE = "측정기록.json"
+PRESENTMON = "PresentMon.exe"
+GAME_SECONDS = 20       # 재는 시간
+GAME_DELAY = 10         # 버튼을 누르고 게임으로 돌아갈 시간
+WAKE_ROUNDS = 30
+TIMER_COUNT = 200
+
+# (값 이름, 무엇, 단위, 작을수록 좋은가, 흔들림으로 보는 폭(절대), (상대))
+SYSTEM_METRICS = [
+    ("frame_wait", "화면에 뜨기까지 평균 대기", "ms", True, 0.3, 0.0),
+    ("wake_short", "짧게(4ms) 쉬었다 일할 때 늦게 출발", "%", True, 5.0, 0.0),
+    ("wake_long", "잠깐(30ms) 쉬었다 일할 때 늦게 출발", "%", True, 5.0, 0.0),
+    ("timer_p99", "1ms 기다리기 — 가장 늦을 때", "ms", True, 0.3, 0.15),
+]
+GAME_METRICS = [
+    ("fps", "평균 프레임", "fps", False, 0.0, 0.03),
+    ("low1", "1% 저점 프레임", "fps", False, 0.0, 0.05),
+    ("stutters", "끊김 (평소보다 크게 늦은 장면)", "번", True, 1.0, 0.0),
+    ("latency", "화면에 뜨기까지", "ms", True, 0.5, 0.1),
+]
+
+# PresentMon 이 알려주는 '화면 방식' — 전체 화면 최적화가 실제로 꺼졌는지가 여기서 보인다
+PRESENT_MODES = {
+    "hardware: legacy flip": "진짜 전체 화면 — 게임이 화면을 직접 씁니다 (전체 화면 최적화 꺼짐)",
+    "hardware: legacy copy to front buffer": "진짜 전체 화면 (옛날 방식)",
+    "hardware: independent flip": "윈도우가 창처럼 관리하지만 화면에는 바로 나갑니다 — 지연은 "
+                                  "전체 화면과 거의 같습니다",
+    "hardware composed: independent flip": "윈도우가 창처럼 관리하지만 화면에는 바로 나갑니다",
+    "composed: flip": "창처럼 한 번 합성돼서 늦게 나옵니다 — 게임 화면 모드를 '전체 화면' 으로",
+    "composed: copy with gpu gdi": "창처럼 한 번 합성돼서 늦게 나옵니다 — 게임 화면 모드를 '전체 화면' 으로",
+    "composed: copy with cpu gdi": "창처럼 한 번 합성돼서 늦게 나옵니다 — 게임 화면 모드를 '전체 화면' 으로",
+}
+
+
+def _spin(count: int) -> int:
+    total = 0
+    for number in range(count):
+        total += number * number
+    return total
+
+
+def _timed(count: int) -> float:
+    start = time.perf_counter()
+    _spin(count)
+    return time.perf_counter() - start
+
+
+def _median(values) -> float:
+    ordered = sorted(values)
+    return ordered[len(ordered) // 2] if ordered else 0.0
+
+
+def cpu_wake(rounds: int | None = None) -> dict:
+    """쉬었다가 다시 일을 시작할 때 CPU 가 얼마나 늦게 출발하나 (%).
+
+    게임은 한 장면을 그리고 → 잠깐 쉬고 → 다음 장면을 그린다. 절전이 강하면 쉬는 동안
+    CPU 가 속도를 내렸다가 다시 올리느라 다음 장면이 늦게 출발한다. 그게 '순간 끊김' 이다.
+
+    같은 일을 '쉬었다가 한 번' 과 '바로 이어서 한 번' 짝지어 재고, 그 비율의 가운데 값을
+    쓴다. 짝마다 바로 옆에서 비교하므로, 재는 동안 다른 프로그램이 끼어들거나 컴퓨터가
+    데워져 전체가 느려져도 결과가 덜 흔들린다.
+    """
+    rounds = rounds or WAKE_ROUNDS
+    _spin(300_000)                                  # 예열
+    count = 5_000
+    while _timed(count) < 0.0015 and count < 5_000_000:
+        count *= 2
+    result = {}
+    for name, gap in (("wake_short", 0.004), ("wake_long", 0.03)):
+        ratios = []
+        for _ in range(rounds):
+            time.sleep(gap)
+            rested = _timed(count)                  # 쉬었다가 바로
+            busy = _timed(count)                    # 이미 달리고 있을 때
+            if busy > 0:
+                ratios.append(rested / busy)
+        result[name] = round((_median(ratios) - 1) * 100, 1) if ratios else 0.0
+    return result
+
+
+def timer_accuracy(count: int | None = None) -> dict:
+    """1ms 만 기다리라고 했을 때, 가장 늦게 깨어난 경우 (상위 1%)."""
+    samples = []
+    for _ in range(count or TIMER_COUNT):
+        start = time.perf_counter()
+        time.sleep(0.001)
+        samples.append((time.perf_counter() - start) * 1000)
+    samples.sort()
+    return {"timer_p99": round(samples[min(len(samples) - 1, int(len(samples) * 0.99))], 2)}
+
+
+def measure_system(ctx) -> dict:
+    values = {}
+    screens = ctx.display.monitors()
+    hz = max((screen.hz for screen in screens), default=0)
+    if hz:
+        values["hz"] = hz
+        values["frame_wait"] = round(500 / hz, 2)
+    values.update(cpu_wake())
+    values.update(timer_accuracy())
+    return values
+
+
+def load_measures(root: Path | None = None) -> list:
+    try:
+        data = json.loads((backup_folder(root) / MEASURE_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [entry for entry in data if isinstance(entry, dict)] if isinstance(data, list) else []
+
+
+def save_measure(kind: str, values: dict, applied: bool, root: Path | None = None,
+                 when: datetime | None = None) -> dict:
+    entry = {"when": (when or datetime.now()).isoformat(timespec="seconds"), "kind": kind,
+             "applied": bool(applied), "values": values}
+    history = (load_measures(root) + [entry])[-60:]
+    folder = backup_folder(root)
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / MEASURE_FILE).write_text(json.dumps(history, ensure_ascii=False, indent=1),
+                                       encoding="utf-8")
+    return entry
+
+
+def paired(history: list, kind: str):
+    """같은 종류 측정 중 가장 최근의 '최적화 안 됨' 과 '최적화 적용' 한 쌍."""
+    def latest(applied):
+        return next((entry for entry in reversed(history)
+                     if entry.get("kind") == kind and bool(entry.get("applied")) is applied), None)
+    return latest(False), latest(True)
+
+
+def judge_change(before, after, lower_better: bool, noise_abs: float, noise_rel: float) -> str:
+    if before is None or after is None:
+        return ""
+    change = after - before
+    if abs(change) <= max(noise_abs, abs(before) * noise_rel):
+        return "차이 없음"
+    return "좋아짐" if (change < 0) == lower_better else "나빠짐"
+
+
+# --- 게임 프레임 (PresentMon) --------------------------------------------
+@dataclass
+class GameResult:
+    frames: int = 0
+    fps: float = 0.0
+    low1: float = 0.0
+    stutters: int = 0
+    latency: float | None = None
+    mode: str = ""
+    error: str = ""
+
+    def values(self) -> dict:
+        return {"frames": self.frames, "fps": round(self.fps, 1), "low1": round(self.low1, 1),
+                "stutters": self.stutters,
+                "latency": round(self.latency, 1) if self.latency is not None else None,
+                "mode": self.mode}
+
+
+def presentmon_path() -> Path | None:
+    """exe 안에 같이 넣어둔 PresentMon. 파이썬으로 돌릴 때는 이 폴더에 두면 쓴다."""
+    for base in (getattr(sys, "_MEIPASS", None), Path(__file__).resolve().parent, ROOT):
+        if base and (Path(base) / PRESENTMON).is_file():
+            return Path(base) / PRESENTMON
+    return None
+
+
+def _float(value) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number else None     # NaN 은 버린다
+
+
+def parse_presentmon(text: str, process: str | None = None) -> GameResult:
+    """PresentMon CSV 에서 평균·1% 저점 프레임, 끊김, 화면까지 지연, 화면 방식을 뽑는다.
+
+    PresentMon 버전마다 열 이름이 조금 다르다 (FrameTime / MsBetweenPresents,
+    DisplayLatency / MsUntilDisplayed). 둘 다 받는다.
+    """
+    reader = csv.DictReader(io.StringIO(text or ""))
+    columns = {name.strip().lower(): name for name in (reader.fieldnames or [])}
+    frame_col = columns.get("frametime") or columns.get("msbetweenpresents")
+    if frame_col is None:
+        return GameResult(error="PresentMon 기록을 읽지 못했습니다.")
+    wait_col = columns.get("displaylatency") or columns.get("msuntildisplayed")
+    mode_col, app_col = columns.get("presentmode"), columns.get("application")
+    chain_col = columns.get("swapchainaddress")
+
+    chains: dict = {}
+    for row in reader:
+        if process and app_col and (row.get(app_col) or "").strip().lower() != process.lower():
+            continue
+        chains.setdefault(row.get(chain_col, "") if chain_col else "", []).append(row)
+    rows = max(chains.values(), key=len, default=[])      # 화면을 그리는 스왑체인 하나만
+
+    times = [value for value in (_float(row.get(frame_col)) for row in rows[1:])
+             if value is not None and value > 0]
+    if len(times) < 10:
+        return GameResult(frames=len(times), error="잡힌 장면이 너무 적습니다. 게임 화면이 떠 "
+                                                   "있는 상태(맵 안)에서 재야 합니다.")
+    ordered = sorted(times)
+    slowest = ordered[min(len(ordered) - 1, int(len(ordered) * 0.99))]
+    middle = ordered[len(ordered) // 2]
+    waits = [value for value in (_float(row.get(wait_col)) for row in rows) if value is not None] \
+        if wait_col else []
+    modes = [(row.get(mode_col) or "").strip() for row in rows] if mode_col else []
+    common = max(set(modes), key=modes.count) if modes else ""
+    return GameResult(
+        frames=len(times),
+        fps=1000 / (sum(times) / len(times)),
+        low1=1000 / slowest,
+        # 평소 장면보다 2.5배 넘게, 그리고 60fps 한 장면(16.7ms)보다 오래 걸린 장면
+        stutters=sum(1 for value in times if value > max(middle * 2.5, 16.7)),
+        latency=_median(waits) if waits else None,
+        mode=common,
+    )
+
+
+def mode_words(mode: str) -> str:
+    return PRESENT_MODES.get((mode or "").strip().lower(), mode or "알 수 없음")
+
+
+def _beep(times: int = 1) -> None:
+    if not WINDOWS:
+        return
+    try:                                        # pragma: no cover - 윈도우 전용
+        import winsound
+
+        for _ in range(times):
+            winsound.Beep(880, 160)
+            time.sleep(0.08)
+    except Exception:                           # pragma: no cover - 윈도우 전용
+        pass
+
+
+def measure_game(ctx, process: str | None = None, seconds: int | None = None,
+                 delay: int | None = None, beep: bool = True) -> GameResult:
+    """게임이 켜져 있을 때 실제 프레임을 잰다. 시작할 때 '삐' 한 번, 끝나면 두 번."""
+    seconds = seconds or GAME_SECONDS
+    delay = GAME_DELAY if delay is None else delay
+    if not ctx.windows:
+        return GameResult(error="윈도우에서만 잴 수 있습니다.")
+    tool = presentmon_path()
+    if tool is None:
+        return GameResult(error="프레임 측정 도구(PresentMon)가 없습니다. exe 판에 들어 있습니다.")
+    if not ctx.admin:
+        return GameResult(error="관리자 권한이 있어야 잴 수 있습니다 (윈도우 화면 기록을 읽습니다).")
+    process = process or (ctx.install.exe_name if ctx.install else "SuddenAttack.exe")
+    if process.lower() not in running_programs(ctx.shell):
+        return GameResult(error=f"{process} 가 켜져 있지 않습니다. 게임을 켜고 맵에 들어간 뒤 "
+                                "누르세요.")
+
+    handle, name = tempfile.mkstemp(prefix="sa-frames-", suffix=".csv")
+    os.close(handle)
+    path = Path(name)
+    if beep:
+        threading.Timer(delay, _beep, args=(1,)).start()
+    try:
+        result = ctx.shell.run(
+            [str(tool), "--process_name", process, "--output_file", str(path),
+             "--no_console_stats", "--stop_existing_session", "--session_name",
+             "SuddenAttackOptimizer", "--delay", str(delay), "--timed", str(seconds),
+             "--terminate_after_timed"],
+            timeout=delay + seconds + 40)
+        text = path.read_text(encoding="utf-8-sig", errors="replace") if path.exists() else ""
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    if beep:
+        _beep(2)
+    if not text.strip():
+        detail = (result.err or result.out or "").strip()[:200]
+        return GameResult(error=f"프레임 기록이 나오지 않았습니다. {detail}".strip())
+    return parse_presentmon(text, process)
+
+
+# ============================================================================
+# [11] 안내문 — 자동으로 못 바꾸는 것들
 # ============================================================================
 #
 # 프로그램이 대신 못 해주는 것들 — 그리고 일부러 안 하는 것들.
@@ -2749,7 +3493,7 @@ def guide_sections(spec=None) -> list[Section]:
 
 
 # ============================================================================
-# [10] 화면 — 브라우저에 뜨는 페이지
+# [12] 화면 — 브라우저에 뜨는 페이지
 # ============================================================================
 #
 # 브라우저에 뜨는 화면. 외부 라이브러리 없이 파이썬 표준 http.server 만 쓴다.
@@ -2776,6 +3520,7 @@ class Screen:
         self.notice = ""
         self.result = None
         self.ping = None                # 마지막으로 잰 핑 (Check)
+        self.check_notice = ""          # 작은 '적용 확인' 창에 띄울 말
         self.closing = False            # 관리자 창을 새로 띄웠으면 이 창은 물러난다
         # 이 화면에서 누른 버튼인지 확인하는 표. 다른 웹사이트는 이 값을 알 수 없다.
         self.token = secrets.token_urlsafe(24)
@@ -2797,6 +3542,7 @@ class Screen:
             _result(self.result),
             _hero(ready, statuses),
             _verdicts_box(statuses, spec),
+            _measure_box(load_measures(self.root), presentmon_path() is not None, ctx.windows),
             _checks_box(self.checks(spec), self.ping, ctx.windows),
             _basics(spec),
             _game_box(ctx),
@@ -2806,6 +3552,27 @@ class Screen:
             _footer(self.root),
         ]
         return _with_token(_PAGE.format(style=_STYLE, body="\n".join(body)), self.token)
+
+    def render_check(self) -> str:
+        """작은 '적용 확인' 창 — 항목마다 윈도우에서 지금 읽은 값과, 그 창을 여는 버튼."""
+        ctx = self.optimizer.ctx
+        body = _check_page(self.optimizer.statuses(), ctx, self.check_notice)
+        self.check_notice = ""
+        return _with_token(_PAGE.format(style=_STYLE, body=body), self.token)
+
+    def measure_now(self) -> str:
+        applied = latest_record(self.root) is not None
+        save_measure("system", measure_system(self.optimizer.ctx), applied, self.root)
+        state = "최적화 적용" if applied else "최적화 안 됨"
+        return f"컴퓨터를 쟀습니다 ({state} 상태). 아래 '성능 측정' 칸에서 전·후를 비교해 보세요."
+
+    def measure_game_now(self) -> str:
+        game = measure_game(self.optimizer.ctx)
+        if game.error:
+            return game.error
+        save_measure("game", game.values(), latest_record(self.root) is not None, self.root)
+        return (f"게임 프레임을 쟀습니다 — 평균 {game.fps:.0f}fps · 1% 저점 {game.low1:.0f}fps · "
+                f"끊김 {game.stutters}번. 아래 '성능 측정' 칸을 보세요.")
 
     def render_bye(self, message: str = "이 창은 닫으셔도 됩니다.") -> str:
         return _PAGE.format(
@@ -2865,6 +3632,14 @@ class Screen:
             if self.optimizer.ctx.install:
                 return f"찾았습니다: {self.optimizer.ctx.install.exe}"
             return "그 경로에서 실행 파일을 못 찾았습니다. 서든어택 폴더나 exe 를 넣어주세요."
+        if action == "view":
+            return open_view((params.get("key") or [""])[0], self.optimizer.ctx)
+        if action == "measure":
+            self.result = None
+            return self.measure_now()
+        if action == "game":
+            self.result = None
+            return self.measure_game_now()
         if action == "recheck":
             self.result = None
             self._checks = None
@@ -2938,6 +3713,11 @@ def _head(spec, ctx) -> str:
     )
 
 
+# 작은 '적용 확인' 창을 여는 버튼. 브라우저가 막으면 같은 탭에서 연다.
+CHECK_BUTTON = ('<button type="button" class="sub check-open" onclick="openCheck()">'
+        '적용 확인 — 작은 창으로 보기</button>')
+
+
 def _hero(ready, statuses) -> str:
     total = len([s for s in statuses if s.tweak.recommended])
     done = len([s for s in statuses if s.tweak.recommended and s.state == ON])
@@ -2959,7 +3739,8 @@ def _hero(ready, statuses) -> str:
         '<input type="hidden" name="action" value="apply_all">'
         f"{button}</form>"
         '<p class="muted small">누르면 아래 목록에서 ✅ 표시된 권장 항목만 적용합니다. '
-        "몇 초 걸립니다.</p></section>"
+        "몇 초 걸립니다.</p>"
+        f"<p>{CHECK_BUTTON}</p></section>"
     )
 
 
@@ -3209,7 +3990,8 @@ def _result(outcome) -> str:
     )
     reboot = ('<p class="warn-inline">재부팅해야 적용되는 항목이 있습니다.</p>'
               if outcome.reboot else "")
-    return f'<section class="card result"><h3>{esc(outcome.summary)}</h3><ul>{rows}</ul>{reboot}</section>'
+    return (f'<section class="card result"><h3>{esc(outcome.summary)}</h3><ul>{rows}</ul>{reboot}'
+            f"<p>{CHECK_BUTTON}</p></section>")
 
 
 def _footer(root=None) -> str:
@@ -3246,6 +4028,119 @@ def _checks_box(found, ping, windows: bool) -> str:
         '<button class="mini">다시 점검</button></form>'
         f'<span class="muted small">핑은 게임 서버가 아니라 {esc(PING_HOST)} 까지 잽니다. '
         "평균보다 흔들림과 손실을 보세요.</span></div></section>"
+    )
+
+
+def _number_text(value, unit: str) -> str:
+    if value is None:
+        return "—"
+    if unit == "%":
+        return f"{value:+.0f}%"
+    if unit == "fps":
+        return f"{value:.0f}"
+    if unit == "번":
+        return f"{int(value)}번"
+    return f"{value:.2f}ms" if value < 10 else f"{value:.1f}ms"
+
+
+def _pair_table(history: list, kind: str, metrics: list) -> str:
+    before, after = paired(history, kind)
+    if before is None and after is None:
+        return ""
+
+    def head(entry, name):
+        when = (entry or {}).get("when", "")[5:16].replace("T", " ")
+        return f"<th>{name}<br><span>{esc(when) or '기록 없음'}</span></th>"
+
+    rows = []
+    for key, label, unit, lower, noise_abs, noise_rel in metrics:
+        old = (before or {}).get("values", {}).get(key)
+        new = (after or {}).get("values", {}).get(key)
+        if old is None and new is None:
+            continue
+        verdict = judge_change(old, new, lower, noise_abs, noise_rel)
+        tone = {"좋아짐": "m-good", "나빠짐": "m-bad"}.get(verdict, "m-same")
+        rows.append(f"<tr><td>{esc(label)}</td><td>{_number_text(old, unit)}</td>"
+                    f"<td>{_number_text(new, unit)}</td><td class=\"{tone}\">{esc(verdict)}</td></tr>")
+    modes = [entry.get("values", {}).get("mode") for entry in (before, after) if entry]
+    extra = ""
+    if kind == "game" and any(modes):
+        extra = "".join(f'<p class="muted small">화면 방식 ({label}): {esc(mode_words(mode))}</p>'
+                        for label, mode in zip(("안 됨", "적용"), [
+                            (before or {}).get("values", {}).get("mode"),
+                            (after or {}).get("values", {}).get("mode")]) if mode)
+    return ('<table class="m-table"><tr><th></th>' + head(before, "최적화 안 됨")
+            + head(after, "최적화 적용") + "<th></th></tr>" + "".join(rows) + "</table>" + extra)
+
+
+def _measure_box(history: list, can_game: bool, windows: bool) -> str:
+    """성능 측정 — 최적화 전·후를 같은 방법으로 잰 숫자."""
+    system = _pair_table(history, "system", SYSTEM_METRICS)
+    game = _pair_table(history, "game", GAME_METRICS)
+    before, _ = paired(history, "system")
+    hint = ""
+    if before is None:
+        hint = ('<p class="muted small">\'최적화 안 됨\' 기록이 없습니다. 처음 실행하면 적용 전·후를 '
+                "알아서 잽니다. 이미 적용한 컴퓨터라면 <b>되돌리기 → 지금 측정 → 다시 적용 → 지금 "
+                "측정</b> 순서로 비교할 수 있습니다.</p>")
+    game_button = (
+        '<form method="post" action="/action" class="inline" onsubmit="wait(this)">'
+        '<input type="hidden" name="action" value="game">'
+        '<button class="mini" data-wait="재는 중… (30초, 게임으로 돌아가세요)">게임 프레임 재기 (30초)'
+        "</button></form>" if can_game and windows else
+        '<button class="mini" disabled>게임 프레임 재기</button>')
+    game_note = ("서든어택을 켜고 <b>맵 안에 들어간 뒤</b> 이 버튼 → 10초 안에 게임으로 돌아가 평소처럼 "
+                 "움직이세요. '삐' 에 재기 시작해서 20초 뒤 '삐삐' 면 끝입니다. 전체 화면 최적화·우선순위는 "
+                 "게임을 다시 켜야 먹으니, 전·후 비교는 게임을 껐다 켜고 재세요."
+                 if can_game else "게임 프레임 측정 도구(PresentMon)는 exe 판에 들어 있습니다.")
+    empty = '<p class="muted small">아직 잰 기록이 없습니다.</p>'
+    return (
+        '<section class="card measure"><h3>성능 측정 — 이 컴퓨터에서 실제로 잰 값</h3>'
+        f"{system or empty}{hint}"
+        '<div class="c-bar"><form method="post" action="/action" class="inline" onsubmit="wait(this)">'
+        '<input type="hidden" name="action" value="measure">'
+        '<button class="mini" data-wait="재는 중… (3초)">지금 측정 (3초)</button></form>'
+        f"{game_button}</div>"
+        f'<p class="muted small">{game_note}</p>{game}'
+        '<p class="muted small">흔들림 폭 안의 차이는 \'차이 없음\' 으로 적습니다. 같은 컴퓨터도 잴 때마다 '
+        "조금씩 다르게 나오기 때문입니다.</p></section>"
+    )
+
+
+def _check_page(statuses, ctx, notice: str) -> str:
+    """작은 창에 뜨는 '적용 확인' — 윈도우에서 방금 읽은 값과, 그 창을 여는 버튼."""
+    marks = {ON: ("✅", "적용됨", "on"), OFF: ("⬜", "안 됨", "off"),
+             UNKNOWN: ("❔", "확인 불가", "hm"), NA: ("—", "해당 없음", "na")}
+    count = {ON: 0, OFF: 0}
+    rows = []
+    for status in statuses:
+        tweak = status.tweak
+        mark, word, tone = marks.get(status.state, ("?", status.state, "hm"))
+        count[status.state] = count.get(status.state, 0) + 1
+        view = VIEWS.get(tweak.key)
+        button = look = ""
+        if view is not None and status.state != NA:
+            look = f'<div class="k-look">{esc(view.look)}</div>'
+            if ctx.windows:
+                button = ('<form method="post" action="/action" class="k-open">'
+                          '<input type="hidden" name="action" value="view">'
+                          f'<input type="hidden" name="key" value="{esc(tweak.key)}">'
+                          '<input type="hidden" name="back" value="check">'
+                          f'<button class="mini">{esc(view.label)}</button></form>')
+        rows.append(
+            f'<div class="k-row {tone}"><div class="k-top"><span>{mark}</span>'
+            f'<b>{esc(tweak.title)}</b><span class="k-state">{esc(word)}</span></div>'
+            f'<div class="k-live">{esc(live_line(tweak, ctx))}</div>{button}{look}</div>')
+    top = (f'<p class="muted small">윈도우에서 방금 읽은 값입니다. 적용됨 {count[ON]} · 안 됨 '
+           f"{count[OFF]}. 버튼을 누르면 그 설정이 보이는 윈도우 창이 화면 오른쪽 위에 작게 "
+           "뜹니다.</p>")
+    if not ctx.windows:
+        top += '<div class="warn">윈도우가 아니라서 창은 열 수 없습니다.</div>'
+    return (
+        '<div class="check-page"><h2>적용 확인</h2>'
+        f"{_notice(notice)}{top}{''.join(rows)}"
+        '<p class="c-bar"><a href="/check">다시 읽기</a> · '
+        '<a href="#" onclick="window.close(); return false;">닫기</a></p></div>'
     )
 
 
@@ -3381,6 +4276,24 @@ footer { margin-top:28px; text-align:center; }
 .c-mark.warn { background:var(--warnbg); color:var(--warn); border-color:var(--warn); }
 .c-mark.good { color:var(--ok); border-color:var(--ok); }
 .c-bar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:12px; }
+.check-open { margin-top:4px; }
+.m-table { width:100%; border-collapse:collapse; font-size:.86rem; margin:8px 0 4px; }
+.m-table th, .m-table td { padding:6px 8px; border-top:1px solid var(--line); text-align:right; }
+.m-table th:first-child, .m-table td:first-child { text-align:left; }
+.m-table th { font-weight:600; }
+.m-table th span { font-weight:400; color:var(--muted); font-size:.75rem; }
+.m-good { color:var(--ok); font-weight:600; }
+.m-bad { color:var(--bad); font-weight:600; }
+.m-same { color:var(--muted); }
+.check-page h2 { margin:0 0 6px; font-size:1.15rem; }
+.k-row { border-top:1px solid var(--line); padding:9px 0; font-size:.88rem; }
+.k-top { display:flex; gap:8px; align-items:center; }
+.k-state { margin-left:auto; font-size:.75rem; color:var(--muted); white-space:nowrap; }
+.k-live { margin:4px 0 6px 26px; font-family:ui-monospace,Consolas,monospace; font-size:.8rem;
+  overflow-wrap:anywhere; }
+.k-row.off .k-live { color:var(--warn); }
+.k-open { margin-left:26px; }
+.k-look { margin:5px 0 0 26px; color:var(--muted); font-size:.8rem; }
 input[type=text], input:not([type]) { font:inherit; padding:6px 10px; border-radius:8px;
   border:1px solid var(--line); background:var(--bg); color:var(--fg); }
 """
@@ -3397,6 +4310,12 @@ _PAGE = """<!doctype html>
 function wait(form) {{
   var button = form.querySelector('button');
   if (button) {{ button.disabled = true; button.textContent = button.dataset.wait || '하는 중…'; }}
+}}
+// 적용 확인은 작은 창으로 띄운다. 팝업이 막히면 이 탭에서 연다.
+function openCheck() {{
+  var small = window.open('/check', 'sa_check', 'width=500,height=740,left=40,top=40');
+  if (!small) {{ location.href = '/check'; }}
+  return false;
 }}
 </script>
 {body}
@@ -3447,6 +4366,8 @@ class _Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path in ("/", "/index.html"):
             self._html(self.screen.render())
+        elif path == "/check":
+            self._html(self.screen.render_check())
         elif path == "/healthz":
             self._respond(b"ok", "text/plain; charset=utf-8")
         else:
@@ -3473,14 +4394,19 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         action = (params.get("action") or [""])[0]
-        self.screen.notice = self.screen.run(action, params)
+        back = (params.get("back") or [""])[0]
+        message = self.screen.run(action, params)
+        if back == "check":             # 작은 확인 창에서 누른 버튼은 그 창으로 돌아간다
+            self.screen.check_notice = message
+        else:
+            self.screen.notice = message
         if self.screen.closing:
             # 관리자 권한으로 새 창이 떴다. 이 창은 물러나야 창이 두 개로 헷갈리지 않는다.
             self._html(self.screen.render_bye(self.screen.notice))
             threading.Thread(target=self.server.shutdown, daemon=True).start()
             return
         self.send_response(303)
-        self.send_header("Location", "/")
+        self.send_header("Location", "/check" if back == "check" else "/")
         self.end_headers()
 
     def _html(self, text: str, status: int = 200):
@@ -3523,7 +4449,7 @@ def _open(url: str) -> None:
 
 
 # ============================================================================
-# [11] 시작 지점 — 더블클릭과 명령줄
+# [13] 시작 지점 — 더블클릭과 명령줄
 # ============================================================================
 def use_utf8_output() -> None:
     """한글이 깨지지 않게. 윈도우 콘솔은 기본이 cp949 라서 그냥 두면 글자가 깨진다."""
@@ -3557,16 +4483,30 @@ def auto_apply(screen: Screen) -> bool:
     keys = optimizer.recommended_keys()
     if not keys:
         return False
+    _quiet_measure(screen)              # 바꾸기 전
     screen.result = optimizer.apply(keys)
+    _quiet_measure(screen)              # 바꾼 뒤
     screen.notice = ("처음 실행이라 이 컴퓨터에 맞는 설정을 알아서 적용했습니다 "
-                     f"({screen.result.summary}). 마음에 안 들면 아래 '원래대로 되돌리기' 를 "
-                     "누르면 전부 원래대로 돌아옵니다.")
+                     f"({screen.result.summary}). 바꾸기 전·후를 재둔 값은 '성능 측정' 칸에, "
+                     "각 설정이 정말 바뀌었는지는 '적용 확인' 버튼에 있습니다. 마음에 안 들면 "
+                     "'원래대로 되돌리기' 한 번이면 전부 돌아옵니다.")
     return True
+
+
+def _quiet_measure(screen: Screen) -> None:
+    """측정이 실패해도 최적화는 계속한다. 측정은 덤이다."""
+    try:
+        screen.measure_now()
+    except Exception as exc:
+        log.warning("측정하지 못했습니다: %s", exc)
 
 
 def cmd_screen(args) -> int:
     optimizer = build_optimizer()
     screen = Screen(optimizer, root=ROOT)
+    if not args.no_auto and optimizer.ctx.windows and optimizer.ctx.admin and first_run(ROOT):
+        print()
+        print("  처음 실행입니다 — 이 컴퓨터를 재고, 맞는 설정을 적용하고, 다시 잽니다 (10초쯤)…")
     applied = False if args.no_auto else auto_apply(screen)
     server, url = start_screen(screen, port=args.port, open_browser=not args.no_browser)
 
@@ -3653,6 +4593,72 @@ def cmd_apply(args) -> int:
     return 0 if not outcome.failed else 1
 
 
+def _print_pair(kind: str, metrics: list) -> None:
+    before, after = paired(load_measures(ROOT), kind)
+    print(f"  {'':34}{'최적화 안 됨':>12}{'최적화 적용':>12}")
+    for key, label, unit, lower, noise_abs, noise_rel in metrics:
+        old = (before or {}).get("values", {}).get(key)
+        new = (after or {}).get("values", {}).get(key)
+        if old is None and new is None:
+            continue
+        verdict = judge_change(old, new, lower, noise_abs, noise_rel)
+        print(f"  {label:34}{_number_text(old, unit):>12}{_number_text(new, unit):>12}  {verdict}")
+
+
+def cmd_measure(args) -> int:
+    optimizer = build_optimizer()
+    print()
+    print("  재는 중… (3초쯤)")
+    applied = latest_record(ROOT) is not None
+    save_measure("system", measure_system(optimizer.ctx), applied, ROOT)
+    print(f"  지금 상태: {'최적화 적용' if applied else '최적화 안 됨'}")
+    print()
+    _print_pair("system", SYSTEM_METRICS)
+    return 0
+
+
+def cmd_game(args) -> int:
+    optimizer = build_optimizer()
+    print()
+    print(f"  {args.delay}초 뒤부터 {args.seconds}초 동안 잽니다. 게임으로 돌아가세요.")
+    game = measure_game(optimizer.ctx, args.process, args.seconds, args.delay, beep=not args.quiet)
+    if game.error:
+        print("  " + game.error)
+        return 1
+    save_measure("game", game.values(), latest_record(ROOT) is not None, ROOT)
+    print(f"  장면 {game.frames}개 · 평균 {game.fps:.0f}fps · 1% 저점 {game.low1:.0f}fps · "
+          f"끊김 {game.stutters}번")
+    if game.latency is not None:
+        print(f"  화면에 뜨기까지 {game.latency:.1f}ms")
+    print(f"  화면 방식: {game.mode or '-'} — {mode_words(game.mode)}")
+    print()
+    _print_pair("game", GAME_METRICS)
+    return 0
+
+
+def cmd_check(args) -> int:
+    optimizer = build_optimizer()
+    marks = {ON: "[적용됨]", OFF: "[ 안됨 ]", UNKNOWN: "[확인??]", NA: "[해당없음]"}
+    print()
+    for status in optimizer.statuses():
+        print(f"  {marks.get(status.state, '[  ?  ]')} {status.tweak.title}")
+        print(f"             {live_line(status.tweak, optimizer.ctx)}")
+    return 0
+
+
+def cmd_show(args) -> int:
+    optimizer = build_optimizer()
+    print("  " + open_view(args.key, optimizer.ctx))
+    view = VIEWS.get(args.key)
+    if WINDOWS and view is not None and view.target == "properties":
+        # 속성 창은 이 프로그램 안에서 뜬다. 닫을 때까지 기다려야 창이 같이 안 사라진다.
+        time.sleep(1.5)
+        deadline = time.monotonic() + 600
+        while time.monotonic() < deadline and _matching(view):
+            time.sleep(0.5)
+    return 0
+
+
 def cmd_revert(args) -> int:
     optimizer = build_optimizer()
     outcome = optimizer.revert()
@@ -3693,6 +4699,19 @@ def main(argv=None) -> int:
     apply_cmd.set_defaults(func=cmd_apply)
 
     sub.add_parser("revert", help="마지막 최적화 되돌리기").set_defaults(func=cmd_revert)
+
+    sub.add_parser("measure", help="컴퓨터 성능 재기 (3초, 전·후 비교)").set_defaults(func=cmd_measure)
+    game = sub.add_parser("game", help="게임 프레임 재기 (서든어택을 켠 상태에서)")
+    game.add_argument("--process", default=None, help="잴 프로그램 (기본: 서든어택)")
+    game.add_argument("--seconds", type=int, default=GAME_SECONDS)
+    game.add_argument("--delay", type=int, default=GAME_DELAY)
+    game.add_argument("--quiet", action="store_true", help="삐 소리 없이")
+    game.set_defaults(func=cmd_game)
+
+    sub.add_parser("check", help="적용됐는지 윈도우에서 읽은 값으로 확인").set_defaults(func=cmd_check)
+    show = sub.add_parser("show", help="그 설정이 보이는 윈도우 창 열기")
+    show.add_argument("key", choices=sorted(VIEWS))
+    show.set_defaults(func=cmd_show)
 
     args = parser.parse_args(argv)
     logging.basicConfig(

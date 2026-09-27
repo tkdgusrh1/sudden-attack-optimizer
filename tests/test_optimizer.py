@@ -453,7 +453,7 @@ def test_power_plan_duplicates_instead_of_editing_the_current_one():
     record = tweak.action.apply(ctx)
     assert record["before"] == BALANCED
     assert ctx.shell.active == record["created"] != BALANCED
-    assert ctx.shell.schemes[record["created"]] == "서든어택 최적화"
+    assert ctx.shell.schemes[record["created"]] == "서든어택 최적화 (SA-Optimizer)"
     assert BALANCED not in ctx.shell.tuned, "균형 조정 계획에는 값을 쓴 적이 없어야 한다"
     # 항목 5개 × (AC·배터리) 인데, 프로세서 최소 100% 는 전원을 꽂았을 때만 건다
     assert len(ctx.shell.tuned[record["created"]]) == 9
@@ -1518,3 +1518,242 @@ def test_the_guide_explains_more_vendor_tweaks_we_skip():
     text = guide_text()
     for word in ("메모리 무결성", "Spectre", "타이머 해상도", "TcpWindowSize"):
         assert word in text, word
+
+
+# ============================================================================
+# 2.4 적용 확인 창 · 성능 측정
+# ============================================================================
+import optimizer as _module  # noqa: E402
+from optimizer import (  # noqa: E402
+    GAME_METRICS, PLAN_NAME, SYSTEM_METRICS, VIEWS, _is_our_plan, _measure_box, judge_change,
+    live_line, load_measures, measure_game, measure_system, mode_words, open_view,
+    paired, parse_presentmon, processor_minimum, save_measure,
+)
+
+
+@pytest.fixture(autouse=True)
+def quick_measures(monkeypatch):
+    """측정은 원래 3초쯤 걸린다. 검사에서는 몇 번만 돈다."""
+    monkeypatch.setattr(_module, "WAKE_ROUNDS", 3)
+    monkeypatch.setattr(_module, "TIMER_COUNT", 5)
+
+
+# --- 적용 확인 ---------------------------------------------------------------
+def test_every_item_has_a_windows_window_to_check_it():
+    assert set(VIEWS) == {tweak.key for tweak in catalog()}
+    for key, view in VIEWS.items():
+        kind = view.target.partition(":")[0]
+        assert kind in ("control", "uri", "exe", "regedit", "properties"), key
+        assert view.look and view.titles, key
+
+
+def test_the_check_lines_read_this_computer_before_and_after():
+    ctx = fake_context()
+    line = {key: live_line(find(key), ctx) for key in
+            ("mouse_accel", "fullscreen_opt", "power_plan", "nagle", "refresh_rate", "game_dvr")}
+    assert "켜짐 (MouseSpeed = 1)" in line["mouse_accel"]
+    assert "아무것도 없음" in line["fullscreen_opt"]
+    assert "균형 조정" in line["power_plan"]
+    assert "1개 중 0개" in line["nagle"]
+    assert "60Hz (이 해상도 최대 144Hz)" in line["refresh_rate"]
+    assert "게임 녹화 기능: 켜짐" in line["game_dvr"]
+
+    Optimizer(ctx).apply(["mouse_accel", "fullscreen_opt", "power_plan", "nagle", "game_dvr"])
+    assert "꺼짐 (MouseSpeed = 0)" in live_line(find("mouse_accel"), ctx)
+    assert "전체 화면 최적화 사용 안 함" in live_line(find("fullscreen_opt"), ctx)
+    assert PLAN_NAME in live_line(find("power_plan"), ctx)
+    assert "1개 중 1개" in live_line(find("nagle"), ctx)
+    assert "게임 녹화 기능: 꺼짐" in live_line(find("game_dvr"), ctx)
+
+
+def test_the_processor_minimum_is_read_from_powercfg_in_any_language():
+    korean = """전원 설정 GUID: 893dee8e-2bef-41e0-89c6-b55d0929964c  (최소 프로세서 상태)
+      최소 가능한 설정: 0x00000000
+      최대 가능한 설정: 0x00000064
+      가능한 설정 증분: 0x00000001
+      가능한 설정 단위: %
+    현재 AC 전원 설정 인덱스: 0x00000064
+    현재 DC 전원 설정 인덱스: 0x00000005"""
+    ctx = fake_context(shell=FakeShell(replies={"PROCTHROTTLEMIN": Result(ok=True, out=korean)}))
+    assert processor_minimum(ctx) == 100
+
+
+def test_our_power_plan_is_recognised_even_when_hangul_prints_as_question_marks():
+    assert _is_our_plan("서든어택 최적화")                      # 예전 이름
+    assert _is_our_plan("???? ??? (SA-Optimizer)")             # 한국어가 아닌 윈도우
+    assert not _is_our_plan("균형 조정")
+
+
+def test_the_small_check_page_lists_everything_with_buttons(tmp_path):
+    screen = make(tmp_path)
+    page = screen.render_check()
+    assert "적용 확인" in page
+    for tweak in catalog():
+        assert _module.esc(tweak.title) in page
+    assert "MouseSpeed = 1" in page
+    assert "마우스 속성 열기" in page and _module.esc("'포인터 정확도 향상' 체크") in page
+    assert page.count(f'name="token" value="{screen.token}"') == page.count("<form")
+
+
+def test_the_main_page_offers_the_small_check_window(tmp_path):
+    page = make(tmp_path).render()
+    assert "openCheck()" in page and "window.open('/check'" in page
+
+
+def test_opening_a_window_off_windows_says_so(tmp_path):
+    assert "윈도우에서만" in open_view("mouse_accel", fake_context(windows=False))
+    assert "열어볼 창이 없습니다" in open_view("없는항목", fake_context())
+
+
+def test_a_button_in_the_check_window_comes_back_to_it(tmp_path):
+    import optimizer
+    import threading
+
+    screen = make(tmp_path, windows=False)
+    server, url = optimizer.start_screen(screen, port=18790, open_browser=False)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        import urllib.request
+        with urllib.request.urlopen(url + "check", timeout=5) as response:
+            assert response.status == 200
+        body = {"action": "view", "key": "mouse_accel", "back": "check", "token": screen.token}
+        assert post(url, body) == 303
+        assert "윈도우에서만" in screen.render_check()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+# --- 컴퓨터 측정 ----------------------------------------------------------------
+def test_the_system_measurement_has_every_number():
+    values = measure_system(fake_context())
+    assert values["hz"] == 60 and values["frame_wait"] == 8.33
+    for key, *_ in SYSTEM_METRICS:
+        assert key in values, key
+
+
+def test_changes_inside_the_noise_are_called_no_change():
+    assert judge_change(10.0, 10.2, True, 0.3, 0.0) == "차이 없음"
+    assert judge_change(8.33, 3.47, True, 0.3, 0.0) == "좋아짐"
+    assert judge_change(300, 250, False, 0.0, 0.03) == "나빠짐"
+    assert judge_change(300, 305, False, 0.0, 0.03) == "차이 없음"
+    assert judge_change(None, 3, True, 0, 0) == ""
+
+
+def test_first_run_measures_before_and_after(tmp_path):
+    screen = make(tmp_path)
+    auto_apply(screen)
+    history = load_measures(tmp_path)
+    assert [entry["applied"] for entry in history] == [False, True]
+    before, after = paired(history, "system")
+    assert before["values"]["frame_wait"] == 8.33          # 60Hz
+    assert after["values"]["frame_wait"] == 3.47           # 144Hz
+    page = screen.render()
+    assert "성능 측정" in page and "8.33ms" in page and "3.47ms" in page and "좋아짐" in page
+
+
+def test_without_a_before_value_the_page_says_how_to_get_one(tmp_path):
+    save_measure("system", {"frame_wait": 3.47}, True, tmp_path)
+    page = _measure_box(load_measures(tmp_path), False, True)
+    assert "되돌리기 → 지금 측정 → 다시 적용 → 지금 측정" in page
+
+
+def test_measure_button_records_the_current_state(tmp_path):
+    screen = make(tmp_path)
+    assert "최적화 안 됨" in screen.run("measure", {})
+    screen.run("apply", {"key": ["mouse_accel"]})
+    assert "최적화 적용" in screen.run("measure", {})
+    assert [entry["applied"] for entry in load_measures(tmp_path)] == [False, True]
+
+
+# --- 게임 측정 (PresentMon) --------------------------------------------------
+V2_HEADER = ("Application,ProcessID,SwapChainAddress,PresentRuntime,SyncInterval,PresentFlags,"
+             "AllowsTearing,PresentMode,CPUStartTime,FrameTime,CPUBusy,CPUWait,GPULatency,GPUTime,"
+             "GPUBusy,GPUWait,DisplayLatency,DisplayedTime,AnimationError,AnimationTime,MsFlipDelay,"
+             "AllInputToPhotonLatency,ClickToPhotonLatency")
+
+
+def v2_csv(times, app="SuddenAttack.exe", mode="Hardware: Legacy Flip", latency=12.0):
+    rows = [V2_HEADER]
+    for number, frame in enumerate(times):
+        rows.append(f"{app},4242,0x00000001,D3D9,0,0,1,{mode},{number * 3.0},{frame},1,1,0.5,1,1,0,"
+                    f"{latency},{frame},0,0,0,NA,NA")
+    return "\n".join(rows) + "\n"
+
+
+def test_presentmon_v2_output_is_read():
+    game = parse_presentmon(v2_csv([99.0] + [3.0] * 199 + [30.0]), "SuddenAttack.exe")
+    assert game.error == ""
+    assert game.frames == 200                   # 첫 줄은 측정 전 간격이라 뺀다
+    assert 300 < game.fps < 330
+    assert game.stutters == 1
+    assert game.latency == 12.0
+    assert "진짜 전체 화면" in mode_words(game.mode)
+
+
+def test_presentmon_v1_output_is_read_too():
+    header = ("Application,ProcessID,SwapChainAddress,PresentRuntime,SyncInterval,PresentFlags,"
+              "AllowsTearing,PresentMode,TimeInSeconds,MsBetweenSimulationStart,MsBetweenPresents,"
+              "MsBetweenDisplayChange,MsInPresentAPI,MsRenderPresentLatency,MsUntilDisplayed")
+    rows = [header] + [f"SuddenAttack.exe,1,0x1,D3D9,0,0,1,Composed: Flip,{n},NA,5.0,5.0,0.1,1.0,NA"
+                       for n in range(50)]
+    game = parse_presentmon("\n".join(rows), "SuddenAttack.exe")
+    assert round(game.fps) == 200
+    assert game.latency is None                 # NA 는 버린다
+    assert "창처럼" in mode_words(game.mode)
+
+
+def test_only_the_game_and_its_busiest_swapchain_count():
+    text = v2_csv([3.0] * 100) + v2_csv([50.0] * 100, app="Discord.exe").split("\n", 1)[1]
+    assert round(parse_presentmon(text, "SuddenAttack.exe").fps) == 333
+
+
+def test_too_few_frames_is_an_error_not_a_number():
+    assert "너무 적습니다" in parse_presentmon(v2_csv([3.0] * 5)).error
+    assert parse_presentmon("엉뚱한 글자").error
+
+
+def test_game_measurement_explains_why_it_cannot_run(tmp_path, monkeypatch):
+    assert "윈도우에서만" in measure_game(fake_context(windows=False)).error
+    monkeypatch.setattr(_module, "presentmon_path", lambda: None)
+    assert "PresentMon" in measure_game(fake_context()).error
+    monkeypatch.setattr(_module, "presentmon_path", lambda: tmp_path / "PresentMon.exe")
+    assert "관리자" in measure_game(fake_context(admin=False)).error
+    assert "켜져 있지 않습니다" in measure_game(fake_context(), beep=False).error
+
+
+def test_game_measurement_runs_presentmon_and_reads_what_it_wrote(tmp_path, monkeypatch):
+    monkeypatch.setattr(_module, "presentmon_path", lambda: tmp_path / "PresentMon.exe")
+    calls = []
+
+    class Windows(FakeWindows):
+        def run(self, args, timeout=60):
+            calls.append(list(args))
+            if args[0] == "tasklist":
+                return Result(ok=True, out='"SuddenAttack.exe","1","Console","1","1 K"')
+            if args[0].endswith("PresentMon.exe"):
+                target = Path(args[args.index("--output_file") + 1])
+                target.write_text(v2_csv([4.0] * 300), encoding="utf-8")
+                return Result(ok=True)
+            return super().run(args, timeout)
+
+    game = measure_game(fake_context(shell=Windows()), beep=False)
+    assert game.error == "" and round(game.fps) == 250
+    command = next(call for call in calls if call[0].endswith("PresentMon.exe"))
+    assert command[command.index("--process_name") + 1] == "SuddenAttack.exe"
+    assert "--terminate_after_timed" in command
+    assert not Path(command[command.index("--output_file") + 1]).exists(), "임시 파일은 치운다"
+
+
+def test_the_page_says_where_game_measurement_lives(tmp_path):
+    assert "exe 판에 들어 있습니다" in _measure_box([], False, True)
+    assert "게임 프레임 재기 (30초)" in _measure_box([], True, True)
+    save_measure("game", {"fps": 300.0, "low1": 180.0, "stutters": 2, "latency": 14.0,
+                          "mode": "Composed: Flip"}, False, tmp_path)
+    save_measure("game", {"fps": 305.0, "low1": 210.0, "stutters": 0, "latency": 11.0,
+                          "mode": "Hardware: Legacy Flip"}, True, tmp_path)
+    page = _measure_box(load_measures(tmp_path), True, True)
+    assert "1% 저점 프레임" in page and "180" in page and "210" in page
+    assert "진짜 전체 화면" in page and "창처럼" in page
+    for key, *_ in GAME_METRICS:
+        assert key
