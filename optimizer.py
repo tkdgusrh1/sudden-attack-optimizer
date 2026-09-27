@@ -75,7 +75,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 # 화면 아래에 표시된다. 무엇이 돌고 있는지 바로 확인할 수 있게 올려둔다.
-__version__ = "2.4.1"
+__version__ = "2.4.2"
 
 log = logging.getLogger("서든어택최적화")
 
@@ -2932,6 +2932,22 @@ def top_windows() -> list:
     return found
 
 
+def own_windows() -> list:
+    """이 프로그램 안에서 뜬 창들 (exe 속성 창이 그렇다)."""
+    if not WINDOWS:
+        return []
+    from ctypes import wintypes                 # pragma: no cover - 윈도우 전용
+
+    user32 = _user32()
+    found = []
+    for window in top_windows():
+        owner = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(window[0], ctypes.byref(owner))
+        if owner.value == os.getpid():
+            found.append(window)
+    return found
+
+
 def _matching(view: View) -> list:
     return [window for window in top_windows()
             if window[1] == view.window and any(word in window[2] for word in view.titles)]
@@ -4661,9 +4677,10 @@ def cmd_show(args) -> int:
     view = VIEWS.get(args.key)
     if WINDOWS and view is not None and view.target == "properties":
         # 속성 창은 이 프로그램 안에서 뜬다. 닫을 때까지 기다려야 창이 같이 안 사라진다.
+        # 제목으로 찾으면 '마우스 속성' 같은 남의 창까지 걸리므로, 이 프로그램의 창만 본다.
         time.sleep(1.5)
         deadline = time.monotonic() + 600
-        while time.monotonic() < deadline and _matching(view):
+        while time.monotonic() < deadline and own_windows():
             time.sleep(0.5)
     return 0
 

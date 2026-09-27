@@ -116,9 +116,12 @@ def open_and_look(key: str) -> list:
     screenshot(f"view-{key}")
     close(fresh)
     time.sleep(1)
-    if process.poll() is None:
-        process.kill()
-    output = process.stdout.read().decode("utf-8", errors="replace").strip() if process.stdout else ""
+    # exe 는 두 겹(풀어주는 쪽 + 실제 프로그램)으로 돈다. 한 겹만 끄면 나머지가 남는다.
+    subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], capture_output=True)
+    try:
+        output = process.communicate(timeout=15)[0].decode("utf-8", errors="replace").strip()
+    except subprocess.TimeoutExpired:
+        output = "(출력을 못 읽음)"
     if output:
         note("      " + output.replace("\n", "\n      "))
     return fresh
