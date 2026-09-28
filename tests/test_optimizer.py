@@ -1907,8 +1907,8 @@ def test_apply_says_so_when_windows_did_not_take_it(tmp_path, monkeypatch):
 
 def test_refresh_rate_opens_the_monitor_tab_not_scaling():
     view = VIEWS["refresh_rate"]
-    assert "display-advanced" not in view.target
-    assert view.target.startswith("exe:rundll32.exe display.dll,ShowAdapterSettings")
+    assert view.target == "uri:ms-settings:display"      # display-advanced 는 배율 설정이 열린다
+    assert "고급 디스플레이" in view.look
 
 
 def test_size_text():

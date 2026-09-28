@@ -77,7 +77,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 # 화면 아래에 표시된다. 무엇이 돌고 있는지 바로 확인할 수 있게 올려둔다.
-__version__ = "2.5.1"
+__version__ = "2.5.2"
 
 log = logging.getLogger("서든어택최적화")
 
@@ -2606,12 +2606,14 @@ VIEWS = {
         "마우스 속성 열기",
         "'포인터 옵션' 탭 → '포인터 정확도 향상' 체크가 풀려 있으면 적용된 것입니다.",
         "control:main.cpl,,2", titles=("마우스 속성", "Mouse Properties")),
-    # ms-settings:display-advanced 는 윈도우 11 에서 '고급 배율 설정' 으로 열린다. 그래서
-    # 윈도우 10 · 11 어디서나 같은 창인 옛 '어댑터 속성' 의 '모니터' 탭을 연다.
+    # ms-settings:display-advanced 는 윈도우 11 에서 '고급 배율 설정' 으로 열리고, 옛 어댑터
+    # 속성 창(rundll32 display.dll)은 창이 안 뜨는 컴퓨터가 있었다. 그래서 확실히 열리는
+    # '디스플레이' 화면을 열고, 거기서 한 번만 누르게 한다.
     "refresh_rate": View(
-        "모니터 속성 열기",
-        "'모니터' 탭 → '화면 재생 빈도' 가 모니터 최대값(예: 180Hz)이면 적용된 것입니다.",
-        "exe:rundll32.exe display.dll,ShowAdapterSettings 1", titles=("속성", "Properties")),
+        "디스플레이 설정 열기",
+        "아래쪽 '고급 디스플레이' 를 누르세요 → '새로 고침 빈도 선택' 이 모니터 최대값(예: 180Hz)"
+        "이면 적용된 것입니다.",
+        "uri:ms-settings:display", *_SETTINGS_APP),
     "fullscreen_opt": View(
         "서든어택 속성 열기",
         "'호환성' 탭 → '전체 화면 최적화 사용 안 함' 이 체크돼 있으면 적용된 것입니다.",
