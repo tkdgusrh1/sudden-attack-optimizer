@@ -1536,6 +1536,8 @@ def quick_measures(monkeypatch):
     """측정은 원래 3초쯤 걸린다. 검사에서는 몇 번만 돈다."""
     monkeypatch.setattr(_module, "WAKE_ROUNDS", 3)
     monkeypatch.setattr(_module, "TIMER_COUNT", 5)
+    # 가짜 컴퓨터로 검사한다. 윈도우에서 돌 때 진짜 마우스 값을 읽으면 결과가 그 컴퓨터를 따라간다.
+    monkeypatch.setattr(_module, "system_mouse", lambda: None)
 
 
 # --- 적용 확인 ---------------------------------------------------------------
