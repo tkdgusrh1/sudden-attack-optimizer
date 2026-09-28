@@ -1793,3 +1793,96 @@ def test_no_frames_is_explained_in_words_not_tool_output(tmp_path, monkeypatch):
     error = measure_game(fake_context(shell=Windows()), beep=False).error
     assert "게임 장면이 하나도 잡히지 않았습니다" in error
     assert "Started recording" not in error
+
+
+# ============================================================================
+# 찌꺼기 비우기 — 오래된 임시 파일만 지우고, 최근 것 · 링크 너머는 남긴다
+# ============================================================================
+import os  # noqa: E402
+import time  # noqa: E402
+
+from optimizer import JunkPlace, clean_junk, junk_places, size_text  # noqa: E402
+
+DAY = 24 * 3600
+
+
+def junk_file(path: Path, size: int, age_days: float, now: float) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"x" * size)
+    old = now - age_days * DAY
+    os.utime(path, (old, old))
+    return path
+
+
+def test_clean_removes_old_junk_and_keeps_fresh_files(tmp_path):
+    now = time.time()
+    temp = tmp_path / "Temp"
+    old = junk_file(temp / "setup.log", 1000, 3, now)
+    nested = junk_file(temp / "old-installer" / "a.cab", 2000, 5, now)
+    os.utime(nested.parent, (now - 5 * DAY, now - 5 * DAY))
+    fresh = junk_file(temp / "in-progress.tmp", 500, 0.1, now)
+
+    result = clean_junk(fake_context(), [JunkPlace("내 임시 파일", temp)], now=now)
+
+    assert not old.exists() and not nested.exists() and not nested.parent.exists()
+    assert fresh.exists() and temp.exists()             # 폴더 자체와 최근 파일은 남는다
+    assert result.freed == 3000 and result.files == 2 and result.kept == 1
+    assert "2.9 KB" in result.summary and "1개는 남겼습니다" in result.summary
+
+
+def test_clean_never_follows_a_link_out_of_the_folder(tmp_path):
+    now = time.time()
+    precious = junk_file(tmp_path / "Documents" / "photo.jpg", 100, 30, now)
+    temp = tmp_path / "Temp"
+    temp.mkdir()
+    try:
+        os.symlink(precious.parent, temp / "link", target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("이 컴퓨터에서는 링크를 못 만든다")
+
+    clean_junk(fake_context(), [JunkPlace("내 임시 파일", temp)], now=now)
+    assert precious.exists() and (temp / "link").exists()
+
+
+def test_clean_skips_admin_places_without_admin(tmp_path):
+    now = time.time()
+    windows_temp = tmp_path / "WinTemp"
+    old = junk_file(windows_temp / "old.tmp", 10, 3, now)
+
+    result = clean_junk(fake_context(admin=False),
+                        [JunkPlace("윈도우 임시 파일", windows_temp, admin=True)], now=now)
+    assert old.exists()
+    assert "관리자 권한" in result.places[0][2]
+
+
+def test_clean_does_nothing_off_windows():
+    result = clean_junk(fake_context(windows=False))
+    assert result.files == 0 and "아무것도 지우지 않았습니다" in result.summary
+
+
+def test_junk_places_are_the_known_folders_once_each():
+    env = {"TEMP": r"C:\Windows\Temp", "LOCALAPPDATA": r"C:\Users\a\AppData\Local",
+           "SystemRoot": r"C:\Windows"}
+    places = junk_places(env)
+    names = [place.name for place in places]
+    assert "윈도우 업데이트가 받아둔 설치 파일" in names
+    assert all("Downloads" not in str(place.path) for place in places)
+    if sys.platform.startswith("win"):   # 윈도우 경로는 윈도우에서만 같은 폴더로 읽힌다
+        assert names.count("윈도우 임시 파일") + names.count("내 임시 파일") == 1
+
+
+def test_clean_button_reports_what_it_freed(tmp_path, monkeypatch):
+    temp = tmp_path / "Temp"
+    junk_file(temp / "old.tmp", 2 * 1024 * 1024, 3, time.time())
+    monkeypatch.setattr(_module, "junk_places", lambda: [JunkPlace("내 임시 파일", temp)])
+
+    screen = make(tmp_path)
+    assert "찌꺼기 비우기" in screen.render()
+    message = screen.run("clean", {})
+    assert "2.0 MB" in message
+    assert "내 임시 파일" in screen.render()
+
+
+def test_size_text():
+    assert size_text(512) == "512 바이트"
+    assert size_text(3 * 1024 ** 3) == "3.0 GB"

@@ -20,6 +20,7 @@
         python optimizer.py show KEY   그 설정이 보이는 윈도우 창 열기
         python optimizer.py measure    컴퓨터 성능 재기 (적용 전·후 비교)
         python optimizer.py game       게임 프레임 재기 (서든어택을 켠 상태에서)
+        python optimizer.py clean      찌꺼기 비우기 (임시 파일 · 업데이트가 받아둔 파일)
 
 파일 안 지도 — 고칠 일이 있으면 [7] 만 보시면 됩니다
     [1]  레지스트리     윈도우 설정값을 읽고 쓴다
@@ -32,9 +33,10 @@
     [8]  실행기         적용하고, 기록하고, 되돌린다
     [9]  확인           적용됐는지 윈도우 창으로 직접 본다
     [10] 측정           정말 좋아졌는지 숫자로 (컴퓨터 · 게임 프레임)
-    [11] 안내문         자동으로 못 바꾸는 것들
-    [12] 화면           브라우저에 뜨는 페이지
-    [13] 시작 지점      더블클릭과 명령줄
+    [11] 찌꺼기 비우기  임시 파일 · 업데이트가 받아둔 파일
+    [12] 안내문         자동으로 못 바꾸는 것들
+    [13] 화면           브라우저에 뜨는 페이지
+    [14] 시작 지점      더블클릭과 명령줄
 
 지키는 것
     · 되돌릴 수 있는 것만 바꾼다. 바꾸기 전 값을 못 읽는 설정은 아예 안 넣었다.
@@ -75,7 +77,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 # 화면 아래에 표시된다. 무엇이 돌고 있는지 바로 확인할 수 있게 올려둔다.
-__version__ = "2.4.2"
+__version__ = "2.5.0"
 
 log = logging.getLogger("서든어택최적화")
 
@@ -3297,7 +3299,157 @@ def measure_game(ctx, process: str | None = None, seconds: int | None = None,
 
 
 # ============================================================================
-# [11] 안내문 — 자동으로 못 바꾸는 것들
+# [11] 찌꺼기 비우기 — 임시 파일 · 업데이트가 받아둔 파일
+# ============================================================================
+#
+# 윈도우 '디스크 정리' 에서 사람들이 손으로 하는 것 중, 지워도 아무 탈이 없는 것만 한다.
+# 설정이 아니라 다 쓴 임시 파일이라 되돌리기 기록에는 남기지 않는다.
+#
+#   · 하루(JUNK_AGE_HOURS) 안에 생긴 파일은 남긴다 — 설치 중이거나 켜져 있는 프로그램 것일 수 있다.
+#   · 쓰는 중이라 안 지워지는 파일은 건너뛴다. 억지로 지우지 않는다.
+#   · 바로가기(심볼릭 링크 · 정션)는 따라가지 않는다. 그 너머는 남의 폴더일 수 있다.
+#   · 이 프로그램이 풀려서 도는 폴더(exe 의 _MEI…)는 건드리지 않는다.
+#
+# 일부러 안 하는 것: 다운로드 폴더 · 휴지통 · 브라우저 캐시 · 그래픽 셰이더 캐시.
+# 셰이더 캐시를 지우면 게임이 처음 몇 판 동안 오히려 끊긴다.
+
+JUNK_AGE_HOURS = 24
+REPARSE_POINT = 0x400           # FILE_ATTRIBUTE_REPARSE_POINT — 링크 · 정션 · 클라우드 자리표시
+
+
+@dataclass(frozen=True)
+class JunkPlace:
+    name: str
+    path: Path
+    admin: bool = False         # 관리자 권한이 있어야 지워지는 곳
+
+
+@dataclass
+class CleanResult:
+    freed: int = 0              # 비운 크기 (바이트)
+    files: int = 0              # 지운 파일 수
+    kept: int = 0               # 쓰는 중이거나 최근 것이라 남긴 수
+    places: list = field(default_factory=list)      # [(이름, 비운 바이트, 한 줄)]
+    note: str = ""
+
+    @property
+    def summary(self) -> str:
+        if self.note:
+            return self.note
+        text = f"찌꺼기 {size_text(self.freed)} (파일 {self.files:,}개)를 비웠습니다."
+        if self.kept:
+            text += f" 쓰는 중이거나 하루 안에 생긴 {self.kept:,}개는 남겼습니다."
+        return text
+
+
+def size_text(size: int) -> str:
+    for unit, step in (("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)):
+        if size >= step:
+            return f"{size / step:.1f} {unit}"
+    return f"{size} 바이트"
+
+
+def junk_places(env=None) -> list:
+    """비울 폴더들. 같은 폴더가 두 번 나오면 한 번만 (관리자로 돌 때 TEMP 가 윈도우 것일 수 있다)."""
+    env = os.environ if env is None else env
+    places = []
+    temp = env.get("TEMP") or env.get("TMP")
+    if temp:
+        places.append(JunkPlace("내 임시 파일", Path(temp)))
+    local = env.get("LOCALAPPDATA")
+    if local:
+        places.append(JunkPlace("프로그램이 튕길 때 남긴 기록", Path(local) / "CrashDumps"))
+    windows = env.get("SystemRoot") or env.get("WINDIR")
+    if windows:
+        places.append(JunkPlace("윈도우 임시 파일", Path(windows) / "Temp", admin=True))
+        places.append(JunkPlace("윈도우 업데이트가 받아둔 설치 파일",
+                                Path(windows) / "SoftwareDistribution" / "Download", admin=True))
+    seen, unique = set(), []
+    for place in places:
+        spot = os.path.normcase(os.path.abspath(place.path))
+        if spot not in seen:
+            seen.add(spot)
+            unique.append(place)
+    return unique
+
+
+def _keep_out() -> set:
+    """지우면 안 되는 폴더 — 지금 이 프로그램이 돌고 있는 곳."""
+    spots = [getattr(sys, "_MEIPASS", None), Path(__file__).resolve().parent, ROOT]
+    return {os.path.normcase(os.path.abspath(spot)) for spot in spots if spot}
+
+
+def _empty_folder(top: Path, cutoff: float, keep: set) -> tuple:
+    """top 안에서 cutoff 보다 오래된 파일을 지운다. top 자체는 남긴다. (비운 바이트, 지운 수, 남긴 수)"""
+    freed = removed = kept = 0
+
+    def walk(folder: str) -> None:
+        nonlocal freed, removed, kept
+        try:
+            entries = list(os.scandir(folder))
+        except OSError:
+            kept += 1
+            return
+        for entry in entries:
+            if os.path.normcase(os.path.abspath(entry.path)) in keep:
+                kept += 1
+                continue
+            try:
+                info = entry.stat(follow_symlinks=False)
+                if entry.is_symlink() or getattr(info, "st_file_attributes", 0) & REPARSE_POINT:
+                    kept += 1
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    walk(entry.path)
+                    if info.st_mtime < cutoff:      # 안을 비우기 전 시각으로 본다
+                        try:
+                            os.rmdir(entry.path)    # 다 비었을 때만 지워진다
+                        except OSError:
+                            pass
+                    continue
+                if info.st_mtime >= cutoff:
+                    kept += 1
+                    continue
+                try:
+                    os.remove(entry.path)
+                except PermissionError:
+                    os.chmod(entry.path, 0o666)     # 읽기 전용 표시가 붙은 임시 파일
+                    os.remove(entry.path)
+                freed += info.st_size
+                removed += 1
+            except OSError:
+                kept += 1                           # 쓰는 중 — 억지로 지우지 않는다
+
+    walk(str(top))
+    return freed, removed, kept
+
+
+def clean_junk(ctx, places=None, now=None) -> CleanResult:
+    if places is None:
+        if not ctx.windows:
+            return CleanResult(note="윈도우가 아니라 아무것도 지우지 않았습니다.")
+        places = junk_places()
+    cutoff = (time.time() if now is None else now) - JUNK_AGE_HOURS * 3600
+    keep = _keep_out()
+    result = CleanResult()
+    for place in places:
+        if place.admin and not ctx.admin:
+            result.places.append((place.name, 0, "관리자 권한이 있어야 비울 수 있어서 건너뜀"))
+            continue
+        if not os.path.isdir(place.path):
+            result.places.append((place.name, 0, "비울 것 없음"))
+            continue
+        freed, removed, kept = _empty_folder(Path(place.path), cutoff, keep)
+        result.freed += freed
+        result.files += removed
+        result.kept += kept
+        result.places.append((place.name, freed, f"{size_text(freed)} · 파일 {removed:,}개"))
+        log.info("찌꺼기 비우기 %s: %s", place.path, size_text(freed))
+    return result
+
+
+# ============================================================================
+# [12] 안내문 — 자동으로 못 바꾸는 것들
 # ============================================================================
 #
 # 프로그램이 대신 못 해주는 것들 — 그리고 일부러 안 하는 것들.
@@ -3518,7 +3670,7 @@ def guide_sections(spec=None) -> list[Section]:
 
 
 # ============================================================================
-# [12] 화면 — 브라우저에 뜨는 페이지
+# [13] 화면 — 브라우저에 뜨는 페이지
 # ============================================================================
 #
 # 브라우저에 뜨는 화면. 외부 라이브러리 없이 파이썬 표준 http.server 만 쓴다.
@@ -3546,6 +3698,7 @@ class Screen:
         self.result = None
         self.ping = None                # 마지막으로 잰 핑 (Check)
         self.check_notice = ""          # 작은 '적용 확인' 창에 띄울 말
+        self.cleaned = None             # 마지막 찌꺼기 비우기 결과 (CleanResult)
         self.closing = False            # 관리자 창을 새로 띄웠으면 이 창은 물러난다
         # 이 화면에서 누른 버튼인지 확인하는 표. 다른 웹사이트는 이 값을 알 수 없다.
         self.token = secrets.token_urlsafe(24)
@@ -3569,6 +3722,7 @@ class Screen:
             _verdicts_box(statuses, spec),
             _measure_box(load_measures(self.root), presentmon_path() is not None, ctx.windows),
             _checks_box(self.checks(spec), self.ping, ctx.windows),
+            _clean_box(self.cleaned, ctx.admin),
             _basics(spec),
             _game_box(ctx),
             _items(statuses),
@@ -3665,6 +3819,10 @@ class Screen:
         if action == "game":
             self.result = None
             return self.measure_game_now()
+        if action == "clean":
+            self.result = None
+            self.cleaned = clean_junk(self.optimizer.ctx)
+            return self.cleaned.summary
         if action == "recheck":
             self.result = None
             self._checks = None
@@ -4053,6 +4211,35 @@ def _checks_box(found, ping, windows: bool) -> str:
         '<button class="mini">다시 점검</button></form>'
         f'<span class="muted small">핑은 게임 서버가 아니라 {esc(PING_HOST)} 까지 잽니다. '
         "평균보다 흔들림과 손실을 보세요.</span></div></section>"
+    )
+
+
+def _clean_box(cleaned, admin: bool) -> str:
+    """찌꺼기 비우기 — 설정이 아니라 다 쓴 임시 파일을 지운다."""
+    rows = ""
+    if cleaned is not None and cleaned.places:
+        rows = "".join(
+            f'<div class="c-row"><span class="c-mark {"good" if freed else "info"}">'
+            f'{"비움" if freed else "—"}</span>'
+            f"<div><b>{esc(name)}</b><span>{esc(line)}</span></div></div>"
+            for name, freed, line in cleaned.places
+        )
+    warn = ""
+    if not admin:
+        warn = ('<p class="warn-inline">관리자 권한이 아니면 윈도우 임시 파일과 업데이트 파일은 '
+                "건너뜁니다.</p>")
+    return (
+        '<section class="card checks"><h3>찌꺼기 비우기</h3>'
+        '<p class="muted small">임시 파일, 프로그램이 튕길 때 남긴 기록, 윈도우 업데이트가 받아둔 '
+        "설치 파일을 지웁니다. 하루 안에 생긴 것과 쓰는 중인 파일은 남깁니다. 다운로드 폴더 · "
+        "휴지통 · 게임 셰이더 캐시는 건드리지 않습니다. 다 쓴 파일이라 되돌리기는 없습니다.</p>"
+        f"{warn}{rows}"
+        '<div class="c-bar">'
+        '<form method="post" action="/action" class="inline" onsubmit="wait(this)">'
+        '<input type="hidden" name="action" value="clean">'
+        '<button class="mini" data-wait="비우는 중…">찌꺼기 비우기</button></form>'
+        '<span class="muted small">빨라지는 건 C 드라이브가 거의 꽉 찼을 때 정도입니다. '
+        "한 달에 한 번이면 충분합니다.</span></div></section>"
     )
 
 
@@ -4474,7 +4661,7 @@ def _open(url: str) -> None:
 
 
 # ============================================================================
-# [13] 시작 지점 — 더블클릭과 명령줄
+# [14] 시작 지점 — 더블클릭과 명령줄
 # ============================================================================
 def use_utf8_output() -> None:
     """한글이 깨지지 않게. 윈도우 콘솔은 기본이 cp949 라서 그냥 두면 글자가 깨진다."""
@@ -4661,6 +4848,17 @@ def cmd_game(args) -> int:
     return 0
 
 
+def cmd_clean(args) -> int:
+    ctx = build_optimizer().ctx
+    result = clean_junk(ctx)
+    print()
+    for name, _, line in result.places:
+        print(f"  {name:28} {line}")
+    print()
+    print("  " + result.summary)
+    return 0
+
+
 def cmd_check(args) -> int:
     optimizer = build_optimizer()
     marks = {ON: "[적용됨]", OFF: "[ 안됨 ]", UNKNOWN: "[확인??]", NA: "[해당없음]"}
@@ -4734,6 +4932,8 @@ def main(argv=None) -> int:
     game.add_argument("--quiet", action="store_true", help="삐 소리 없이")
     game.set_defaults(func=cmd_game)
 
+    sub.add_parser("clean", help="찌꺼기 비우기 (임시 파일 · 업데이트가 받아둔 파일)").set_defaults(
+        func=cmd_clean)
     sub.add_parser("check", help="적용됐는지 윈도우에서 읽은 값으로 확인").set_defaults(func=cmd_check)
     show = sub.add_parser("show", help="그 설정이 보이는 윈도우 창 열기")
     show.add_argument("key", choices=sorted(VIEWS))

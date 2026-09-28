@@ -10,6 +10,7 @@ GitHub 의 윈도우 컴퓨터(관리자 권한)에서 돈다. 이 프로그램�
 실패해도 전체를 멈추지는 않는다. 설정을 바꾸고 되돌리는 쪽은 하나라도 틀리면 실패다.
 """
 
+import os
 import re
 import shutil
 import subprocess
@@ -214,6 +215,21 @@ def main() -> int:
         run("revert")
         listed = shell("powershell", "-NoProfile", "-Command", "(Get-MpPreference).ExclusionPath")
         check("되돌리면 검사 제외에서 빠진다", str(game) not in listed, soft=True)
+
+    note()
+    note("=== 7. 찌꺼기 비우기 — 오래된 임시 파일만 지우고 최근 것은 남기는가 ===")
+    temp = Path(os.environ["TEMP"]) / "sa-e2e-junk"
+    temp.mkdir(exist_ok=True)
+    old, fresh = temp / "old.tmp", temp / "fresh.tmp"
+    old.write_bytes(b"x" * 4096)
+    fresh.write_bytes(b"x" * 4096)
+    stale = time.time() - 3 * 24 * 3600
+    os.utime(old, (stale, stale))
+    code, text = run("clean")
+    check("clean 이 끝까지 성공한다", code == 0 and "비웠습니다" in text)
+    check("사흘 된 임시 파일은 지워진다", not old.exists())
+    check("방금 만든 임시 파일은 남는다", fresh.exists())
+    shutil.rmtree(temp, ignore_errors=True)
 
     note()
     note(f"=== 결과: 실패 {len(FAILED)}개 · 참고-실패 {len(SOFT)}개 ===")
