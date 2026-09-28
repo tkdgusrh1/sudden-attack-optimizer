@@ -169,6 +169,10 @@ def main() -> int:
         check("전원 계획이 우리 것으로 바뀐다", "SA-Optimizer" in active, active)
         check("최소 프로세서 상태(전원 연결)가 100% 다", o.processor_minimum(ctx) == 100,
               f"{o.processor_minimum(ctx)}%")
+    if "mouse_accel" in keys:
+        live = o.system_mouse()
+        check("마우스 가속이 윈도우가 지금 쓰는 값에서도 꺼진다", live is not None and live[2] == 0,
+              f"SPI_GETMOUSE = {live}", soft=True)
     code, text = run("apply")
     check("두 번째 apply 는 아무것도 안 바꾼다", code == 0 and "바꿀 것이 없습니다" in text)
     run("check")

@@ -1883,6 +1883,32 @@ def test_clean_button_reports_what_it_freed(tmp_path, monkeypatch):
     assert "내 임시 파일" in screen.render()
 
 
+# --- 마우스 가속: 레지스트리만 보고 '적용됨' 이라고 하지 않는다 ------------------------
+def test_mouse_is_not_done_when_windows_still_uses_acceleration(monkeypatch):
+    ctx = fake_context()
+    ctx.registry.write("HKCU", r"Control Panel\Mouse", "MouseSpeed", RegValue("0", STR))
+    monkeypatch.setattr(_module, "system_mouse", lambda: (6, 10, 1))
+    assert find("mouse_accel").action.state(ctx) == OFF
+    assert "윈도우가 지금 쓰는 값 = 1" in live_line(find("mouse_accel"), ctx)
+
+    monkeypatch.setattr(_module, "system_mouse", lambda: (0, 0, 0))
+    assert find("mouse_accel").action.state(ctx) == ON
+
+
+def test_apply_says_so_when_windows_did_not_take_it(tmp_path, monkeypatch):
+    monkeypatch.setattr(_module, "system_mouse", lambda: (6, 10, 1))
+    outcome = Optimizer(fake_context(), root=tmp_path).apply(["mouse_accel"])
+    step = outcome.steps[0]
+    assert not step.ok and "아직 안 된 상태" in step.message
+    assert latest_record(tmp_path) is not None          # 넣은 값은 되돌릴 수 있게 기록돼 있다
+
+
+def test_refresh_rate_opens_the_monitor_tab_not_scaling():
+    view = VIEWS["refresh_rate"]
+    assert "display-advanced" not in view.target
+    assert view.target.startswith("exe:rundll32.exe display.dll,ShowAdapterSettings")
+
+
 def test_size_text():
     assert size_text(512) == "512 바이트"
     assert size_text(3 * 1024 ** 3) == "3.0 GB"

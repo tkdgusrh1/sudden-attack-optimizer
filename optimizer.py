@@ -77,7 +77,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 # 화면 아래에 표시된다. 무엇이 돌고 있는지 바로 확인할 수 있게 올려둔다.
-__version__ = "2.5.0"
+__version__ = "2.5.1"
 
 log = logging.getLogger("서든어택최적화")
 
@@ -1590,9 +1590,15 @@ class MouseAction(RegistryAction):
         # MouseSpeed 만 0 이 되고 나머지 두 값(6, 10)은 그대로 남는다. 그것까지 보면
         # 이미 꺼둔 사람에게 "가속이 켜져 있습니다" 라고 거짓말을 하게 된다.
         speed = ctx.registry.read("HKCU", r"Control Panel\Mouse", "MouseSpeed")
-        if speed is None:
+        if speed is None or not _same(speed.data, "0"):
             return OFF
-        return ON if _same(speed.data, "0") else OFF
+        # 레지스트리가 0 이어도 윈도우가 지금 쓰는 값은 켜짐일 수 있다 (다른 계정으로
+        # 관리자 권한을 받았거나, 다른 프로그램이 다시 켰을 때). 마우스 속성 창이 보여주는
+        # 것도 이쪽이다. 레지스트리만 보고 '적용됨' 이라고 하면 거짓말이 된다.
+        live = system_mouse() if ctx.windows else None
+        if live is not None and live[2] != 0:
+            return OFF
+        return ON
 
     def after_apply(self, ctx) -> None:
         if not ctx.windows:
@@ -1605,11 +1611,27 @@ class MouseAction(RegistryAction):
                 int(str(speed.data) if speed else 0),
             )
             SPI_SETMOUSE, UPDATE_AND_TELL = 0x0004, 0x0003
-            ctypes.windll.user32.SystemParametersInfoW(
-                SPI_SETMOUSE, 0, ctypes.byref(values), UPDATE_AND_TELL
-            )
+            if not ctypes.windll.user32.SystemParametersInfoW(
+                    SPI_SETMOUSE, 0, ctypes.byref(values), UPDATE_AND_TELL):
+                log.warning("윈도우가 마우스 설정 변경을 거절했습니다 (오류 %s)",
+                            ctypes.GetLastError())
         except Exception as exc:    # pragma: no cover - 윈도우 전용
-            log.debug("마우스 설정을 즉시 적용하지 못했습니다: %s", exc)
+            log.warning("마우스 설정을 즉시 적용하지 못했습니다: %s", exc)
+
+
+def system_mouse():
+    """윈도우가 지금 실제로 쓰는 마우스 값 (문턱1, 문턱2, 가속). 못 읽으면 None."""
+    if not WINDOWS:
+        return None
+    try:                            # pragma: no cover - 윈도우 전용
+        values = (ctypes.c_int * 3)()
+        SPI_GETMOUSE = 0x0003
+        if not ctypes.windll.user32.SystemParametersInfoW(SPI_GETMOUSE, 0, ctypes.byref(values), 0):
+            return None
+        return tuple(values)
+    except Exception as exc:        # pragma: no cover - 윈도우 전용
+        log.debug("지금 마우스 값을 읽지 못했습니다: %s", exc)
+        return None
 
 
 class NagleAction(RegistryAction):
@@ -2384,6 +2406,18 @@ class Optimizer:
                                           f"기록을 남기지 못해 멈췄습니다. {undone}."))
                 break
 
+            # 넣은 뒤 다시 읽어본다. 값은 썼는데 윈도우가 안 받아들였으면 '적용했습니다' 는 거짓말이다.
+            try:
+                after = tweak.action.state(self.ctx)
+            except Exception as exc:
+                log.debug("%s 적용 후 확인 실패: %s", tweak.key, exc)
+                after = UNKNOWN
+            if after == OFF and not tweak.reboot:
+                outcome.steps.append(Step(
+                    tweak.key, tweak.title, False,
+                    "값은 넣었지만 다시 읽어보니 윈도우에는 아직 안 된 상태입니다. "
+                    "로그아웃했다가 다시 들어온 뒤 '적용 확인' 으로 보세요."))
+                continue
             outcome.steps.append(Step(tweak.key, tweak.title, True, "적용했습니다"))
             if tweak.reboot:
                 outcome.reboot = True
@@ -2572,10 +2606,12 @@ VIEWS = {
         "마우스 속성 열기",
         "'포인터 옵션' 탭 → '포인터 정확도 향상' 체크가 풀려 있으면 적용된 것입니다.",
         "control:main.cpl,,2", titles=("마우스 속성", "Mouse Properties")),
+    # ms-settings:display-advanced 는 윈도우 11 에서 '고급 배율 설정' 으로 열린다. 그래서
+    # 윈도우 10 · 11 어디서나 같은 창인 옛 '어댑터 속성' 의 '모니터' 탭을 연다.
     "refresh_rate": View(
-        "고급 디스플레이 열기",
-        "'새로 고침 빈도' 가 모니터 최대값(예: 180Hz)이면 적용된 것입니다.",
-        "uri:ms-settings:display-advanced", *_SETTINGS_APP),
+        "모니터 속성 열기",
+        "'모니터' 탭 → '화면 재생 빈도' 가 모니터 최대값(예: 180Hz)이면 적용된 것입니다.",
+        "exe:rundll32.exe display.dll,ShowAdapterSettings 1", titles=("속성", "Properties")),
     "fullscreen_opt": View(
         "서든어택 속성 열기",
         "'호환성' 탭 → '전체 화면 최적화 사용 안 함' 이 체크돼 있으면 적용된 것입니다.",
@@ -2677,8 +2713,13 @@ def _read_value(ctx, root, path, name):
 
 def _live_mouse(tweak, ctx) -> str:
     speed = _read_value(ctx, "HKCU", r"Control Panel\Mouse", "MouseSpeed")
-    off = speed is not None and _same(speed.data, "0")
-    return f"포인터 정확도 향상(가속): {'꺼짐' if off else '켜짐'} (MouseSpeed = {_shown(speed)})"
+    saved = speed is not None and _same(speed.data, "0")
+    live = system_mouse() if ctx.windows else None
+    off = saved if live is None else live[2] == 0
+    line = f"포인터 정확도 향상(가속): {'꺼짐' if off else '켜짐'} (MouseSpeed = {_shown(speed)}"
+    if live is not None:
+        line += f", 윈도우가 지금 쓰는 값 = {live[2]}"
+    return line + ")"
 
 
 def _live_refresh(tweak, ctx) -> str:
@@ -2830,7 +2871,7 @@ def open_view(key: str, ctx) -> str:
         if kind == "control":
             subprocess.Popen(["control.exe", target])
         elif kind == "exe":
-            subprocess.Popen([target])
+            subprocess.Popen(target.split())
         elif kind == "uri":
             os.startfile(target)
         elif kind == "regedit":
